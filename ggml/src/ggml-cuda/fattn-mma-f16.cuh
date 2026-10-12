@@ -1747,6 +1747,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const float  * const __restrict__ sinks_f,
         float2       * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
+        float        * const __restrict__ lsek,
         const float scale,
         const float slope,
         const float logit_softcap,
@@ -2163,6 +2164,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int tile_stride = nbatch_combine + 4;
     static_assert((DV/2) % nbatch_combine == 0, "bad nbatch_combine");
 
+    // Per-row log-sum-exp of a whole tile (blocks that only cover part of a tile leave it to the fixup kernels).
+    auto write_lse = [&](const int jc, const float2 KQ_mr) {
+        const int j = jc / ncols2;
+        const int c = jc % ncols2;
+        if ((ncols1 > 1 && jt*ncols1 + j >= int(ne01.z)) || (ncols2 > 1 && zt_gqa*ncols2 + c >= gqa_ratio)) {
+            return;
+        }
+        lsek[(jt*ncols1 + j)*ne02 + c] = KQ_mr.x + logf(KQ_mr.y);
+    };
+
     if constexpr (cols_per_warp == 8) {
         const int jc_cwmo = (threadIdx.x % (2*T_C_VKQ::J)) / T_C_VKQ::J; // jc combine write meta offset
         const int jc_cwm = threadIdx.y*(2*T_C_VKQ::J) + 2*T_C_VKQ::get_j(-1) + jc_cwmo; // jc combine write meta
@@ -2181,6 +2192,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
         if (np == 1) {
             // No combination is needed, the meta data can be directly written from registers to VRAM.
+            if (!needs_fixup && !is_fixup && lsek && threadIdx.x < T_B_KQ::I) {
+                write_lse(jc_cwm, KQ_cmr);
+            }
             if (needs_fixup && threadIdx.x < T_B_KQ::I) {
                 float2 * dstk_fixup_meta = dstk_fixup + (blockIdx.x*gridDim.y + blockIdx.y)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
@@ -2219,6 +2233,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
         if (np == 1) {
             // No combination is needed, the meta data can be directly written from registers to VRAM.
+            if (!needs_fixup && !is_fixup && lsek && thread_should_write) {
+                write_lse(jc_cwm, KQ_cmr);
+            }
             if (needs_fixup && thread_should_write) {
                 float2 * dstk_fixup_meta = dstk_fixup + (blockIdx.x*gridDim.y + blockIdx.y)*ncols;
                 dstk_fixup_meta[jc_cwm] = KQ_cmr;
@@ -2298,6 +2315,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
             // Combined KQ max + rowsum.
             static_assert(cols_per_warp <= warp_size);
+            if (!needs_fixup && !is_fixup && lsek && (cols_per_warp == warp_size || threadIdx.x < cols_per_warp)) {
+                write_lse((threadIdx.y/np)*cols_per_warp + threadIdx.x, make_float2(KQ_cmn, KQ_crs));
+            }
             if (needs_fixup && (cols_per_warp == warp_size || threadIdx.x < cols_per_warp)) {
                 float2 * dstk_fixup_meta = dstk_fixup + (blockIdx.x*gridDim.y + blockIdx.y)*ncols;
                 dstk_fixup_meta[(threadIdx.y/np)*cols_per_warp + threadIdx.x] = make_float2(KQ_cmn, KQ_crs);
