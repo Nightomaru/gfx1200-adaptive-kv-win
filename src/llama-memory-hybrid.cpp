@@ -30,7 +30,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                   size_t   attn_stream_resident_size) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -50,7 +51,9 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        "",
+        attn_stream_resident_size
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -65,6 +68,10 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
     )) {}
+
+llama_kv_stream * llama_memory_hybrid::get_kv_stream() {
+    return mem_attn->get_kv_stream();
+}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
