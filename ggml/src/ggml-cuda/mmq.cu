@@ -539,6 +539,7 @@ void ggml_cuda_mul_mat_q(
     const ggml_prec prec_src1 = gate ? GGML_PREC_Q8 : ggml_cuda_mmq_get_prec_src1(src0, dst, cc);
 
     const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
+    GGML_ASSERT(!swiglu || !use_native_fp4); // the fp4 quantize reads src1, which a fused SWIGLU never writes
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
