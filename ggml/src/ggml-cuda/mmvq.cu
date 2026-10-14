@@ -659,6 +659,14 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 return 1;
         }
     }
+    if (table_id == MMVQ_PARAMETERS_RDNA4) {
+        // RDNA4 runs one wave per block for ncols_dst > 1, and with one row per block every wave reloads the q8_1
+        // activations of all columns for a single row. Four rows share them. Measured on an RX 9070 XT with the
+        // weights streamed from VRAM, 12 types at 2-8 columns: never slower; at 4 columns 19-33% less time for the
+        // K-quants and IQ2/IQ3 types, 2-7% for Q8_0, Q4_0 and IQ4_XS; 23-50% at 8 columns. 8 rows gains little for
+        // the K-quants and loses for the IQ2/IQ3 types.
+        return ncols_dst == 1 ? 1 : 4;
+    }
     return 1;
 }
 
@@ -670,7 +678,7 @@ template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, 
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
-        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
         uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
@@ -1175,6 +1183,14 @@ static __global__ void mul_mat_vec_q_ksplit(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
+    // in the last block of a row count that is not a multiple of rows_per_cuda_block, the rows past the end read the
+    // last row again: their results are not stored, and the reads stay inside the matrix
+    int row_offset[rows_per_cuda_block];
+#pragma unroll
+    for (int i = 0; i < rows_per_cuda_block; ++i) {
+        row_offset[i] = (rows_per_cuda_block == 1 ? 0 : min(i, int(nrows_x) - 1 - row0))*stride_row_x;
+    }
+
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -1190,7 +1206,7 @@ static __global__ void mul_mat_vec_q_ksplit(
             if (kbx_pf < blocks_per_row_x) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
+                    const size_t off = (size_t)(kbx_offset + row_offset[i] + kbx_pf) * ggml_cuda_type_traits<type>::bs;
                     mmvq_prefetch_l2((const char *) vx + off);
                     if constexpr (has_fusion) {
                         if (use_gate) {
@@ -1207,11 +1223,11 @@ static __global__ void mul_mat_vec_q_ksplit(
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    vx, &y[j*stride_col_y + kby], kbx_offset + row_offset[i] + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            vgate, &y[j*stride_col_y + kby], kbx_offset + row_offset[i] + kbx, kqs);
                     }
                 }
             }
@@ -1389,7 +1405,7 @@ static std::pair<dim3, dim3> calc_launch_params(
 template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rows_per_block = 0>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
         const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
