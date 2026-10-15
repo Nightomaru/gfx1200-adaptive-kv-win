@@ -5124,29 +5124,38 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     MMB_T(ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst), 6);
 }
 
-// whether ggml_cuda_mul_mat(ctx, src0, src1, dst) takes the mmq path (the same checks, in the same order)
-static bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+enum ggml_cuda_mul_mat_kernel {
+    GGML_CUDA_MUL_MAT_KERNEL_MMVQ,
+    GGML_CUDA_MUL_MAT_KERNEL_MMQ,
+    GGML_CUDA_MUL_MAT_KERNEL_OTHER,
+};
+
+// the kernel ggml_cuda_mul_mat(ctx, src0, src1, dst) takes, if mmvq or mmq (the same checks, in the same order)
+static ggml_cuda_mul_mat_kernel ggml_cuda_mul_mat_takes(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (ggml_cuda_op_mul_mat_use_fwht(dst)) {
-        return false;
+        return GGML_CUDA_MUL_MAT_KERNEL_OTHER;
     }
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        return false;
+        return GGML_CUDA_MUL_MAT_KERNEL_OTHER;
     }
     const int     cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int     warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
     const int64_t ne11      = src1->ne[1];
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11) || src0->ne[1] == 1) {
-        return false;
+        return GGML_CUDA_MUL_MAT_KERNEL_OTHER;
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
-        return false;
+        return GGML_CUDA_MUL_MAT_KERNEL_OTHER;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
-        return false;
+        return GGML_CUDA_MUL_MAT_KERNEL_MMVQ;
     }
-    return ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
+    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        return GGML_CUDA_MUL_MAT_KERNEL_MMQ;
+    }
+    return GGML_CUDA_MUL_MAT_KERNEL_OTHER;
 }
 
 // SWIGLU whose output only feeds the next node, a MUL_MAT that runs as mmq (the dense FFN down projection in prefill):
@@ -5175,7 +5184,7 @@ static bool ggml_cuda_try_fuse_swiglu_mmq(ggml_backend_cuda_context & ctx, const
     }
     const ggml_type type = mm->src[0]->type;
     if (!ggml_is_quantized(type) || type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4 ||
-            !ggml_cuda_mul_mat_takes_mmq(ctx, mm->src[0], glu, mm)) {
+            ggml_cuda_mul_mat_takes(ctx, mm->src[0], glu, mm) != GGML_CUDA_MUL_MAT_KERNEL_MMQ) {
         return false;
     }
     ggml_cuda_mul_mat_q(ctx, mm->src[0], glu, nullptr, mm, glu);

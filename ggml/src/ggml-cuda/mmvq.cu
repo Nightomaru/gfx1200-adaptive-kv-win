@@ -2036,6 +2036,41 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// The q8_1 copy of src1 (rows padded to MATRIX_ROW_PADDING) that mmvq reads: the previous mmvq's if it quantized the same
+// activations, else quantized into the context's persistent buffer (see ggml_cuda_mmvq_q8_1_cache), or into pool when
+// that cannot take it.
+static const void * mmvq_src1_q8_1(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const ggml_type type_src0, const bool cacheable_op,
+        ggml_cuda_pool_alloc<char> & pool) {
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    const size_t  q8_1_size   = src1->ne[3]*src1->ne[2] * src1->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    ggml_cuda_mmvq_q8_1_cache & cache = ctx.mmvq_q8_1;
+    const bool cacheable = cacheable_op && ctx.curr_stream_no == 0;
+    if (cacheable && cache.matches(src1)) {
+        return cache.buf;
+    }
+    void * q = nullptr;
+    if (cacheable) {
+        q = cache.reserve(q8_1_size, stream);
+    }
+    if (q == nullptr) {
+        q = pool.alloc(q8_1_size);
+    }
+    const size_t  ts  = ggml_type_size(src1->type);
+    const int64_t s11 = src1->nb[1] / ts;
+    const int64_t s12 = src1->nb[2] / ts;
+    const int64_t s13 = src1->nb[3] / ts;
+    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, q, type_src0, src1->ne[0], s11, s12, s13, ne10_padded,
+        src1->ne[1], src1->ne[2], src1->ne[3], stream);
+    if (q == cache.buf) {
+        cache.set(src1);
+    }
+    return q;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -2060,7 +2095,6 @@ void ggml_cuda_mul_mat_vec_q(
     // verify band (MMVQ_MOE_MAX_BATCH_SIZE), so assert on whichever one is the column count.
     GGML_ASSERT((ids ? ne12 : ne1) <= MMVQ_MOE_MAX_BATCH_SIZE);
 
-    const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
 
