@@ -2878,6 +2878,7 @@ struct ggml_cuda_kernel_launch_params {
     dim3 block_dims;
     size_t shmem;
     cudaStream_t stream;
+    bool any_order = false; // HIP: may start before the previous kernel on the stream ends (ggml_cuda_mm_siblings)
 
     // size_t shmem
     ggml_cuda_kernel_launch_params(const dim3& block_nums_, const dim3& block_dims_, const size_t shmem_, const cudaStream_t stream_)
@@ -2994,6 +2995,14 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     }
 #endif //defined(GGML_CUDA_USE_PDL)
 
+#if defined(GGML_USE_HIP)
+    if (launch_params.any_order) {
+        hipExtLaunchKernelGGL(kernel, launch_params.block_nums, launch_params.block_dims, (uint32_t) launch_params.shmem,
+                              launch_params.stream, nullptr, nullptr, hipExtAnyOrderLaunch, std::forward<Args>(args)...);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }

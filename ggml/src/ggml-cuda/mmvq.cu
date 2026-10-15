@@ -2048,12 +2048,13 @@ static const void * mmvq_src1_q8_1(
     const size_t  q8_1_size   = src1->ne[3]*src1->ne[2] * src1->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
 
     ggml_cuda_mmvq_q8_1_cache & cache = ctx.mmvq_q8_1;
-    const bool cacheable = cacheable_op && ctx.curr_stream_no == 0;
+    // a sibling forked onto stream 1 reads the copy too (made before its fork point), but only stream 0 writes it
+    const bool cacheable = cacheable_op && (ctx.curr_stream_no == 0 || ctx.mm_siblings.sibling);
     if (cacheable && cache.matches(src1)) {
         return cache.buf;
     }
     void * q = nullptr;
-    if (cacheable) {
+    if (cacheable && ctx.curr_stream_no == 0) {
         q = cache.reserve(q8_1_size, stream);
     }
     if (q == nullptr) {
@@ -2276,11 +2277,13 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    mmvq_any_order = any_order;
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         nrows_launch,      ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+    mmvq_any_order = false;
 }
 
 static __device__ __forceinline__ float ssm_op_softplus(float x) {

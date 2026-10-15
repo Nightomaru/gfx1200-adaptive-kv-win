@@ -1445,6 +1445,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             }
         }
     }
+    if (mm_siblings.fork_event != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(mm_siblings.fork_event));
+        CUDA_CHECK(cudaEventDestroy(mm_siblings.join_event));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -6678,6 +6682,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
+#if defined(GGML_USE_HIP)
+            // matmuls of the same activations run unfused one after another (ggml_cuda_mm_siblings)
+            std::vector<const ggml_tensor *> mm_group;
+            ggml_cuda_mm_siblings & siblings = cuda_ctx->mm_siblings;
+            siblings.capturing = use_cuda_graph && cuda_graph_update_required && ggml_cuda_mm_siblings_fork_enabled();
+            siblings.fork_node = nullptr;
+#endif // defined(GGML_USE_HIP)
 
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
@@ -6854,6 +6865,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                     cuda_ctx->mmvq_q8_1.apply_pending();
                     i += nodes_to_skip;
+#if defined(GGML_USE_HIP)
+                    mm_group.clear();
+#endif // defined(GGML_USE_HIP)
                     continue;
                 }
 
