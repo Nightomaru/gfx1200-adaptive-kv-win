@@ -588,6 +588,40 @@ static void rms_norm_f32_cuda(
         stream, scale_out, dst16, store_f32);
 }
 
+// ADD(a, b) -> RMS_NORM -> MUL(w): rms_norm_f32<block_size, true> over the sum, which is written too. The sum is
+// formed as the add kernel forms it and the square accumulated as rms_norm_f32 accumulates it, so both outputs are
+// bit-identical to the unfused ops.
+template <int block_size>
+static __global__ void add_rms_norm_mul_f32(const float * a, const float * b, float * sum, float * dst, const float * w,
+                                            const int ncols, const float eps) {
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    extern __shared__ float s_sum[];
+
+    const float * ar = a   + row*ncols;
+    const float * br = b   + row*ncols;
+    float       * sr = sum + row*ncols;
+    float       * dr = dst + row*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = ar[col] + br[col];
+        sr[col] = xi;
+        tmp += xi * xi;
+    }
+
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    // each thread reads back the sums it wrote
+    for (int col = tid; col < ncols; col += block_size) {
+        dr[col] = scale * sr[col] * w[col];
+    }
+}
+
 static void rms_norm_mul_f32_cuda(const ggml_tensor * x_t,
                                   const ggml_tensor * mul_t,
                                   const ggml_tensor * add_t,
