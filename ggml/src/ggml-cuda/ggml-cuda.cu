@@ -6754,6 +6754,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 #endif // USE_CUDA_GRAPH
                 if (is_concurrent_event_active) {
+                    // nodes on other streams run in no order relative to the host's
+                    cuda_ctx->mmvq_q8_1.invalidate();
                     GGML_ASSERT(concurrent_event);
 
                     if (node == concurrent_event->join_node) {
@@ -6838,6 +6840,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    for (int j = i; j <= i + nodes_to_skip; ++j) {
+                        cuda_ctx->mmvq_q8_1.written(cgraph->nodes[j]);
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
