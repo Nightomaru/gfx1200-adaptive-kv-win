@@ -126,7 +126,21 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
     // broadcast over uint to allow for 0x08040201 / 0x80402010 as selectors
-    return s * 0x01010101;
+    return ggml_cuda_bcast_u8(s);
+}
+
+// The bytes of grid, each negated where its sign bit is set: s holds a byte of signs in all 4 bytes; sel picks one bit
+// per byte, 0x08040201 for signs 0-3 and 0x80402010 for 4-7. HIP has no byte-wise SIMD compare or subtract. There m
+// is 1 in the negated bytes and (m << 8) - m is 0xFF there; -g = (g ^ 0xFF) + 1 does not carry into the next byte as
+// the grid bytes of all types that use this are nonzero.
+static __device__ __forceinline__ int ggml_cuda_apply_signs(const int grid, const uint32_t s, const uint32_t sel) {
+#if defined(GGML_USE_HIP)
+    const uint32_t m = (((s & sel) + 0x7F7F7F7Fu) >> 7) & 0x01010101u;
+    return (grid ^ ((m << 8) - m)) + m;
+#else
+    const int mask = __vcmpne4(s & sel, 0);
+    return __vsub4(grid ^ mask, mask);
+#endif // defined(GGML_USE_HIP)
 }
 
 // sign-flips the 4 grid bytes selected by one nibble (shift 0 or 4) of the unpacked ksigns
