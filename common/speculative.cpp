@@ -19,6 +19,7 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <random>
 #include <cinttypes>
@@ -1715,6 +1716,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq, bool adaptive = false, bool align = true)
         : common_speculative_impl(adaptive ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE : COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+    // Single head (qwen35): the catch-up decode of the batch that verifies a draft waits for the next draft() and
+    // runs in its first step, for the rows accept() keeps, so the MTP layer runs once instead of twice. A process()
+    // call that comes first decodes the kept rows below its own first position and drops the rest (a checkpoint
+    // replay decodes them again).
+    struct deferred_row {
+        llama_token id;
+        llama_pos   pos;
+    };
+    bool defer_catchup = false;
+    std::vector<bool>                      defer_next; // [n_seq] draft() ran, so the seq's next batch verifies its draft
+    std::vector<bool>                      defer_cur;  // [n_seq] in process(): the batch's rows of the seq wait
+    std::vector<std::vector<deferred_row>> defer_rows; // [n_seq]
+    std::vector<std::vector<float>>        defer_h;    // [n_seq][n_rows*n_embd] the hidden row paired with each row
+    std::vector<int32_t>                   defer_keep; // [n_seq] rows to keep, set by accept(); -1: all
+    std::vector<std::vector<float>>        flush_h;    // [n_seq] the rows' hidden data while their decode is pending
+
+    common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -1838,6 +1857,38 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        defer_catchup = !is_mem_shared && !chain_heads;
+        defer_next.assign(n_seq, false);
+        defer_cur.assign(n_seq, false);
+        defer_rows.assign(n_seq, {});
+        defer_h.assign(n_seq, {});
+        defer_keep.assign(n_seq, -1);
+        flush_h.assign(n_seq, {});
+    }
+
+    // adds the deferred rows of seq_id below pos_lim to batch (no output) and forgets all of them
+    void take_deferred(llama_seq_id seq_id, llama_pos pos_lim) {
+        auto & rows = defer_rows[seq_id];
+        if (rows.empty()) {
+            return;
+        }
+
+        const int32_t n_keep = defer_keep[seq_id] < 0 ? (int32_t) rows.size() : std::min<int32_t>(defer_keep[seq_id], rows.size());
+
+        // only onto the state they were deferred from: a draft state that was truncated or replaced since does not
+        // end right before them
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
+        if (pos_max == rows[0].pos - 1) {
+            std::swap(flush_h[seq_id], defer_h[seq_id]);
+            for (int32_t i = 0; i < n_keep && rows[i].pos < pos_lim; ++i) {
+                const int32_t idx = batch.add(rows[i].id, rows[i].pos, seq_id, false);
+                batch.set_embd_state(idx, { flush_h[seq_id].data() + (size_t) i * n_embd, 1, (size_t) n_embd });
+            }
+        }
+
+        rows.clear();
+        defer_keep[seq_id] = -1;
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1970,6 +2021,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!is_mem_shared) {
             batch.clear();
 
+            if (defer_catchup) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    const bool in_batch = i_batch_beg[seq_id] >= 0;
+
+                    take_deferred(seq_id, in_batch ? batch_in.tokens[i_batch_beg[seq_id]].pos[0] : std::numeric_limits<llama_pos>::max());
+
+                    // the batch that verifies this seq's draft: a few text tokens
+                    defer_cur[seq_id] = in_batch && defer_next[seq_id] && batch_in.has_token() &&
+                        i_batch_end[seq_id] - i_batch_beg[seq_id] < 64;
+                    if (in_batch) {
+                        defer_next[seq_id] = false;
+                    }
+                    if (defer_cur[seq_id]) {
+                        defer_h[seq_id].clear();
+                    }
+                }
+
+                // on their own: with this batch's rows they could outgrow the draft context's decode batch (rows kept
+                // from an earlier verify, then a verify of another drafter's draft), and all entries of a batch carry
+                // the same content type
+                if (batch.size() > 0) {
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) of deferred rows failed rc=%d\n", (int) rc);
+                        return false;
+                    }
+                    batch.clear();
+                }
+            }
+
             // pair each token with the tgt embedding shifted right by one position, and
             // the first token of each sequence with the pending embedding from a previous run
             // assumes that the tokens in the batch are sequential for each sequence
@@ -1993,15 +2074,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         continue;   // LLAMA_MTP_INGEST_TAIL: a prompt row before the ingested tail
                     }
                 }
+                const float * h_row = k == i_batch_beg[seq_id]
+                    ? pending_h[seq_id].data()
+                    : h_tgt + (size_t) (k - 1) * n_embd;
+
+                if (defer_catchup && defer_cur[seq_id]) {
+                    defer_rows[seq_id].push_back({ t.id, t.pos[0] });
+                    defer_h[seq_id].insert(defer_h[seq_id].end(), h_row, h_row + n_embd);
+                    continue;
+                }
 
                 // vision tokens carry an embedding instead of an id
                 const int32_t idx = t.id != LLAMA_TOKEN_NULL
                     ? batch.add(t.id, t.pos[0], seq_id, false)
                     : batch.add_embd(t.embd, t.pos.data(), seq_id, false);
-
-                const float * h_row = k == i_batch_beg[seq_id]
-                    ? pending_h[seq_id].data()
-                    : h_tgt + (size_t) (k - 1) * n_embd;
 
                 batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
             }
@@ -2086,6 +2172,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
 
+            // deferred rows of a seq that does not draft now stay for its next process(): it may be replaying
             if (!dp.drafting) {
                 continue;
             }
@@ -2117,6 +2204,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // a reset reseeds the chain, which breaks probabilistic drafting
             if (!dp.result_q) {
                 common_sampler_reset(smpls[seq_id].get());
+            }
+
+            if (defer_catchup) {
+                take_deferred(seq_id, dp.pos0);
+                defer_next[seq_id] = true;
             }
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
@@ -2355,6 +2447,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+
+        // the sampled token and the accepted drafts
+        if (defer_catchup && !defer_rows[seq_id].empty()) {
+            defer_keep[seq_id] = n_accepted + 1;
+        }
     }
 
     // partial acceptance on a context that cannot roll back: the rejected draft
@@ -3189,6 +3286,8 @@ common_speculative_init_result::common_speculative_init_result(
     if (spec_mtp) {
         cparams.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
         cparams.mtp_draft_vocab = params.speculative.draft.mtp_vocab;
+        // the first draft step also decodes the rows the last verify kept: one token per slot more than a verify
+        cparams.n_tokens_decode += std::max(params.n_parallel, 1);
 
         // LLAMA_MTP_DRAFT_OP_OFFLOAD=0: keep the draft context's host-resident ops (e.g. the MTP
         // layer's experts under -otd exps=CPU) on the host instead of offloading them to the device
