@@ -562,6 +562,42 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
+    if (mctx_cur->get_n_rs_rec() > 0) {
+        // ReplaySSM: commit the updates the last recording ubatch kept, then record this ubatch's updates (decode
+        // sized ubatches, the state stays the committed one) or advance the state (larger ubatches)
+        const int64_t R      = mctx_cur->get_n_rs_rec();
+        const int64_t row    = S_v * H_v;
+        const bool    record = mctx_cur->rec_records(ubatch);
+
+        ggml_tensor * u_all = mctx_cur->get_u_l(il);
+        GGML_ASSERT(u_all != nullptr && u_all->ne[0] == row * 2 * (2*R + 1));
+
+        // both halves: the op commits from one and records into the other
+        ggml_tensor * rec = ggml_view_3d(ctx0, u_all, row, 2 * (2*R + 1), n_seqs,
+                ggml_row_size(u_all->type, row), u_all->nb[1], kv_head * u_all->nb[1]);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net_rec(ctx0, q, k, v, g, b, s, rec, inp->rec_commit, record);
+        res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, row),
+            ggml_row_size(gdn_out->type, row * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        const size_t state_off = ggml_row_size(gdn_out->type, row * n_seq_tokens * n_seqs);
+        ggml_tensor * new_state = ggml_view_2d(ctx0, gdn_out, hparams.n_embd_s(), n_seqs,
+                ggml_row_size(gdn_out->type, hparams.n_embd_s()), state_off);
+        ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0, new_state,
+                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                        kv_head * ssm_states_all->nb[1])));
+
+        return output;
+    }
+
     const bool keep = cparams.n_rs_seq > 0;
 
     if (!keep) {

@@ -366,6 +366,8 @@ llama_context::llama_context(
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
+    cparams.n_rs_rec = params.rs_replay && cparams.n_rs_seq > 0 && llm_arch_supports_rs_replay(model.arch) ?
+        cparams.n_rs_seq + 1 : 0;
 
     // a rollback candidate decodes the sampled token plus a full draft, which can be longer than
     // the snapshot depth; never allow the bound to drop below the snapshot depth itself
@@ -679,6 +681,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
     LLAMA_LOG_INFO("%s: n_rs_batch            = %u\n",   __func__, cparams.n_rs_batch);
+    LLAMA_LOG_INFO("%s: n_rs_rec              = %u\n",   __func__, cparams.n_rs_rec);
     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
 
@@ -6229,6 +6232,7 @@ llama_context_params llama_context_default_params() {
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
         /*.n_rs_batch                  =*/ 0,
+        /*.rs_replay                   =*/ false,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
