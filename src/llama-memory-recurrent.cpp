@@ -28,7 +28,6 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                  uint32_t   n_rs_batch,
-    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const layer_filter_cb & filter,
                  uint32_t   n_rs_rec) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer();
