@@ -136,8 +136,9 @@ static bool can_reuse_kq_mask(
         ggml_tensor * kq_mask,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
+        const llama_cparams & cparams,
+        bool compact = false) {
+    const auto n_kv     = compact ? mctx->get_n_kv_mask(ubatch, cparams.causal_attn, cparams.flash_attn) : mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
@@ -3425,6 +3426,7 @@ std::unique_ptr<llm_graph_input_attn_kv> llm_graph_context::build_attn_inp_kv_im
 
         inp->self_kq_mask = build_attn_inp_kq_mask(mctx_cur, ubatch, cparams, true);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+        inp->n_kv = mctx_cur->get_n_kv();
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
