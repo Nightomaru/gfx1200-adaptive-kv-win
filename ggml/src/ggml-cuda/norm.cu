@@ -594,9 +594,13 @@ static void rms_norm_f32_cuda(
 // of block_size, so lane l of a warp holds element l of a q8_1 block).
 template <int block_size, bool quantize>
 static __global__ void add_rms_norm_mul_f32(const float * a, const float * b, float * sum, float * dst, const float * w,
-                                            const int ncols, const float eps, block_q8_1 * yq) {
+                                            const int ncols, const float eps, block_q8_1 * yq, const int64_t nrows) {
     const int64_t row = blockIdx.x;
     const int     tid = threadIdx.x;
+
+    if (row >= nrows) {
+        return; // a workgroup past the launch-size cliff (ggml_cuda_nblocks_past_cliff)
+    }
 
     extern __shared__ float s_sum[];
 
