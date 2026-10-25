@@ -1384,6 +1384,43 @@ int ggml_cuda_get_device();
 // the H2D staging ring).  Graphs captured under an older generation are recaptured before their next replay.
 uint64_t ggml_cuda_graph_mem_gen(int device);
 void     ggml_cuda_graph_mem_freed(int device);
+// Read an integer tuning override once: GGML_HIP_* variables re-tune the RDNA4 kernels for a
+// small part (32 CU / gfx1200) without a rebuild. The defaults are the gfx1201 (64 CU) values
+// the kernels were measured with; see docs/rdna4-gfx1200-tuning.md.
+static int ggml_cuda_tuning_int(const char * name, int dflt) {
+    const char * env = getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return dflt;
+    }
+    const int v = atoi(env);
+    return v > 0 ? v : dflt;
+}
+
+// RDNA4: a launch whose wavefronts fall in the last 32 below a multiple of the device's wave slots (nsm counts WGPs,
+// 64 wave slots each: 2048 on a 64-CU part) runs 6-10 us longer than the same work one workgroup wider, whatever the
+// kernel does (gfx1201: 512 workgroups of 128 threads 14.3 us, 513 5.7 us; 512 x 1024 threads over 5120-float rows
+// 31.5 us, 513 26.8 us). Returns the workgroup count to launch: nblocks, or the first count past the window. The
+// extra workgroups must return without work.
+//
+// gfx1200 (RX 9060 XT, 32 CU) reports nsm = 16 on Windows too, so the slot count is 1024 and the rule above carries
+// over unchanged: a scan of a null kernel at 128 threads measured the same shape, a spike exactly at a multiple of
+// the slots (1024 blocks = 4096 waves: 4.04 us against 2.12 at 1023 and 2.48 at 1025).
+static int64_t ggml_cuda_nblocks_past_cliff(const int64_t nblocks, const int nthreads) {
+    const ggml_cuda_device_info::cuda_device_info & info = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    if (!GGML_CUDA_CC_IS_RDNA4(info.cc)) {
+        return nblocks;
+    }
+    const int64_t slots = (int64_t) info.nsm * 64;
+    const int64_t waves = (nthreads + 31) / 32;
+    int64_t n = nblocks;
+    for (int i = 0; i < 64; ++i, ++n) {
+        const int64_t w = n * waves % slots;
+        if (w != 0 && w <= slots - 32) {
+            break;
+        }
+    }
+    return n;
+}
 
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;

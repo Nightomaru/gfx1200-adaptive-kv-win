@@ -5,7 +5,12 @@
 #include <cstdlib>
 #include <vector>
 
-#if defined(GGML_USE_HIP)
+// The HSA path picks a second SDMA engine by hand. It is Linux-only: AMD does not ship an HSA
+// runtime on Windows, so there the copies go on a dedicated non-blocking stream instead (the
+// branch below, shared with CUDA). Measured on a Windows RX 9060 XT (gfx1200), hipHostMalloc
+// host memory is identity-mapped (hipHostGetDevicePointer == the host pointer), readable from
+// kernels and coherent for host writes that kernels poll, which is what KV streaming assumes.
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_HSA_COPY_ENGINE)
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 
@@ -169,7 +174,7 @@ static bool ggml_cuda_copy_engine_done(ggml_backend_copy_engine_t ce, int i) {
     return true;
 }
 
-#endif // defined(GGML_USE_HIP)
+#endif // defined(GGML_USE_HIP) && defined(GGML_HIP_HSA_COPY_ENGINE)
 
 static void * ggml_cuda_copy_engine_alloc_shared(ggml_backend_copy_engine_t ce, size_t size) {
     ggml_cuda_set_device(ce->device);
@@ -177,6 +182,12 @@ static void * ggml_cuda_copy_engine_alloc_shared(ggml_backend_copy_engine_t ce, 
 #if defined(GGML_USE_HIP)
     // the default (HIP_HOST_COHERENT unset) is non-coherent memory, which device kernels cannot poll
     CUDA_CHECK(hipHostMalloc(&p, size, hipHostMallocCoherent | hipHostMallocMapped));
+    // the interface promises the device sees this memory at the same address; the streaming
+    // cache hands these pointers to kernels directly, so a translation would break it
+    void * p_dev = nullptr;
+    if (hipHostGetDevicePointer(&p_dev, p, 0) == hipSuccess && p_dev != p) {
+        GGML_ABORT("copy engine: host memory is not identity-mapped on this device (host %p, device %p)", p, p_dev);
+    }
 #else
     CUDA_CHECK(cudaHostAlloc(&p, size, cudaHostAllocMapped));
 #endif
