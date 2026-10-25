@@ -218,8 +218,9 @@ struct pd_decode_shape {
         n_chunks = (n_kv + PD_CHUNK - 1) / PD_CHUNK;
 
         // One resident wave of blocks: three 8-wave blocks per WGP (nsm counts WGPs on RDNA4). More splits add partial
-        // traffic, fewer leave WGPs idle; this was fastest from 8k to 262k tokens.
-        const int want = 3 * ggml_cuda_info().devices[device].nsm;
+        // traffic, fewer leave WGPs idle; this was fastest from 8k to 262k tokens on a 64-CU part. GGML_HIP_FA_PAGED_
+        // SPLITS_PER_WGP re-tunes it (a 32-CU part has half the WGPs and may want more splits per WGP).
+        const int want = ggml_cuda_tuning_int("GGML_HIP_FA_PAGED_SPLITS_PER_WGP", 3) * ggml_cuda_info().devices[device].nsm;
         n_splits = std::max(1, std::min(n_chunks, (want + n_heads * n_tiles - 1) / (n_heads * n_tiles)));
         chunks_per_split = (n_chunks + n_splits - 1) / n_splits;
         n_splits = (n_chunks + chunks_per_split - 1) / chunks_per_split;

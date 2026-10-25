@@ -135,6 +135,10 @@
 #define cudaGraphNodeTypeKernel hipGraphNodeTypeKernel
 #define cudaGraphInstantiate hipGraphInstantiate
 #define cudaStreamEndCapture hipStreamEndCapture
+// used by the copy engine's stream path (copy-engine.cu), which HIP builds on Windows and any
+// build without the HSA SDMA engine take
+#define cudaEventQuery hipEventQuery
+#define cudaErrorNotReady hipErrorNotReady
 #define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaStreamCaptureStatus hipStreamCaptureStatus
 #define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone

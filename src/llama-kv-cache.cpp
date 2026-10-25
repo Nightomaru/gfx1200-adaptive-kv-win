@@ -1811,11 +1811,11 @@ llama_kv_stream_attn llama_kv_cache::get_kv_stream_attn(ggml_context * ctx, ggml
 
     // the paged decode kernel takes up to decode_max_tokens query tokens (decode and speculative verification), and
     // prefill if it can
-    if (n_tokens <= llama_kv_stream::decode_max_tokens || stream->paged_prefill()) {
+    if (n_tokens <= llama_kv_stream::decode_max_tokens() || stream->paged_prefill()) {
         res.k = get_k(ctx, il, n_kv, sinfo);
         res.v = get_v(ctx, il, n_kv, sinfo);
         res.table = ikv;
-        if (n_tokens > llama_kv_stream::decode_max_tokens) {
+        if (n_tokens > llama_kv_stream::decode_max_tokens()) {
             res.runs = stream->page_runs();
         }
         if (stream->synced()) {

@@ -46,7 +46,23 @@ endif()
 find_package(hip     REQUIRED)
 find_package(hipblas REQUIRED)
 find_package(rocblas REQUIRED)
-find_package(hsa-runtime64 REQUIRED) # copy engine (copy-engine.cu)
+
+# The KV streaming copy engine (copy-engine.cu) picks an SDMA engine that HIP does not use by
+# going through HSA. The HSA runtime headers and library are not shipped on Windows (AMD ships
+# no HSA runtime there), so on Windows the engine falls back to a dedicated non-blocking stream
+# with events, which the same interface already describes.
+if (WIN32)
+    set(GGML_HIP_HSA_COPY_ENGINE_DEFAULT OFF)
+else()
+    set(GGML_HIP_HSA_COPY_ENGINE_DEFAULT ON)
+endif()
+option(GGML_HIP_HSA_COPY_ENGINE "KV streaming: queue host->device copies to a second SDMA engine over HSA (Linux only)" ${GGML_HIP_HSA_COPY_ENGINE_DEFAULT})
+if (GGML_HIP_HSA_COPY_ENGINE)
+    message(STATUS "KV streaming copies go through an HSA SDMA engine")
+    find_package(hsa-runtime64 REQUIRED)
+else()
+    message(STATUS "KV streaming copies go through a dedicated non-blocking stream")
+endif()
 
 if (GGML_HIP_RCCL)
     find_package(rccl REQUIRED)
@@ -85,6 +101,10 @@ if (NOT GGML_BACKEND_DL)
 endif()
 
 add_compile_definitions(GGML_USE_HIP)
+
+if (GGML_HIP_HSA_COPY_ENGINE)
+    add_compile_definitions(GGML_HIP_HSA_COPY_ENGINE)
+endif()
 
 if (GGML_CUDA_FORCE_MMQ)
     add_compile_definitions(GGML_CUDA_FORCE_MMQ)
@@ -142,4 +162,7 @@ if (GGML_HIP_RCCL)
     target_link_libraries(ggml-hip PRIVATE ggml-base roc::rccl)
 endif()
 
-target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas hsa-runtime64::hsa-runtime64)
+target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+if (GGML_HIP_HSA_COPY_ENGINE)
+    target_link_libraries(ggml-hip PRIVATE hsa-runtime64::hsa-runtime64)
+endif()

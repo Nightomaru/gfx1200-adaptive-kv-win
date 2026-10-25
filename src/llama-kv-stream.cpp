@@ -117,6 +117,16 @@ llama_kv_stream::~llama_kv_stream() {
     }
 }
 
+uint32_t llama_kv_stream::decode_max_tokens() {
+    // 96 is the crossover measured on a 64-CU RDNA4 part; a 32-CU one is swept with the env var
+    static const uint32_t n = [] {
+        const char * env = getenv("LLAMA_KV_STREAM_DECODE_MAX");
+        const int v = env != nullptr ? atoi(env) : 0;
+        return (uint32_t) (v > 0 ? v : 96);
+    }();
+    return n;
+}
+
 uint32_t llama_kv_stream::slots_for(size_t bytes, size_t bytes_per_cell) {
     return (uint32_t) std::min<size_t>(bytes/(bytes_per_cell*page_size), UINT32_MAX);
 }
@@ -333,7 +343,7 @@ void llama_kv_stream::prepare(const std::vector<uint32_t> & cells, uint32_t n_kv
     }
 
     // the attended pages that are not resident stream: packed for the decode kernel, in place for a gather
-    const bool decode = cells.size() <= decode_max_tokens || prefill_paged;
+    const bool decode = cells.size() <= decode_max_tokens() || prefill_paged;
 
     std::fill(page_ring.begin(), page_ring.end(), -1);
     n_streamed = 0;
@@ -379,7 +389,7 @@ void llama_kv_stream::prepare(const std::vector<uint32_t> & cells, uint32_t n_kv
     tag++;
     {
         std::lock_guard<std::mutex> lock(mtx);
-        jobs.push_back({ tag, std::move(copies), wb_pending, cells.size() <= decode_max_tokens, n_prepared });
+        jobs.push_back({ tag, std::move(copies), wb_pending, cells.size() <= decode_max_tokens(), n_prepared });
         n_jobs++;
     }
     wb_pending = nullptr;

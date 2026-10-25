@@ -234,7 +234,8 @@ void ggml_cuda_mul_mat_q(
         const int nsm = ggml_cuda_info().devices[id].nsm;
         const ggml_cuda_mmq_config config_best = ggml_cuda_mmq_get_config(src0->type, J_best, fallback, cc, prec_src1);
         const int64_t ntiles = (ne01 + config_best.I - 1)/config_best.I * ((ne11 + J_best - 1)/J_best) * ne12*ne13;
-        if (4*ntiles < nsm) {
+        // the factor is the tiles-per-WGP threshold the narrow tile was measured against on a 64-CU part
+        if (ggml_cuda_tuning_int("GGML_HIP_MMQ_NARROW_TILES_PER_NSM", 4)*ntiles < nsm) {
             for (int J = 8; J < J_best; J += 8) {
                 const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
                 if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
