@@ -54,6 +54,25 @@ Two things to note:
   being a **smaller** cache, so the long-context FA path evidently treats the two type combinations
   differently. Worth measuring before choosing a cache type for depth.
 
+### The tunables: measured at 128K, defaults win
+
+All at `-c 131072 --kv-stream --kv-resident-mib 1024 --kv-resident-mib-decode 1536`, q8_0/q4_0,
+MTP + ngram-mod (decode samples are 26 tokens — the prompt plus 128 generation tokens overflows the
+slot, so the server truncates; prefill numbers are over the full 131,033 tokens):
+
+| arm | prefill t/s | decode t/s |
+| --- | --- | --- |
+| defaults (`splits` 3, `decode_max` 96) | 530.5 | 20.25 |
+| `GGML_HIP_FA_PAGED_SPLITS_PER_WGP=6` | 529.2 | **16.73** — more splits re-read partials, keep 3 |
+| `LLAMA_KV_STREAM_DECODE_MAX=160` | faults at init | needs more ring residency than the card has |
+| `LLAMA_KV_STREAM_DECODE_MAX=64` + `splits=6` | faults at init | as above |
+
+Both failing arms die with `ROCm error: unspecified launch failure` inside
+`ggml_backend_cuda_buffer_set_tensor` / `hipStreamSynchronize` (ggml-cuda.cu:861) within half a
+second of the first compute, i.e. an over-committed allocation rather than a kernel bug. Resident
+pool `2048/3072` fails the same way. **The 64-CU defaults transfer to this part unchanged** — the
+knobs are there to re-measure, not because they needed moving.
+
 ## What had to become tunable
 
 Each of these was a constant measured on a 64-CU part. The default is unchanged, so a gfx1201
