@@ -16,7 +16,43 @@ Measured on Windows 11, RX 9060 XT (`gfx1200`, driver 32.0.32015.7029), ROCm 7.1
 | `multiProcessorCount` counts WGPs on RDNA4 | **16** for a 32-CU part (16 WGP), so `nsm * 64` = **1024 wave slots** (gfx1201: 2048). The formula scales; no change needed. |
 | The launch-size cliff is "the last 32 waves below a multiple of the wave slots" | Same shape: a null kernel at 128 threads takes **4.04 us at 1024 blocks** against 2.12 at 1023 and 2.48 at 1025 — the spike sits exactly on a multiple of 1024, which is the value `nsm * 64` predicts. |
 | Pinned host memory is identity-mapped and coherent (the KV streaming design hands host pointers straight to kernels: the page table, the tag, and the per-layer `ready`/`consumed` flags are host memory that device kernels dereference) | `hipHostMalloc` with `Default`, `Mapped`, and `Mapped\|Coherent` **all** return a device pointer equal to the host pointer; a kernel reads host memory correctly; and a **host write is seen by a kernel polling that address** (the streaming flag path). No pointer translation is needed on this driver. |
-| The SDMA copy engine can be picked over HSA | **Not on Windows**: AMD ships no HSA runtime there. `GGML_HIP_HSA_COPY_ENGINE` is forced `OFF` on `WIN32` and the engine uses a dedicated non-blocking stream with events instead. |
+| The SDMA copy engine can be picked over HSA | **Not on Windows**: AMD ships no HSA runtime there. `GGML_HIP_HSA_COPY_ENGINE` is forced `OFF` on `WIN32` and the engine uses a dedicated non-blocking stream with events instead. **Verified working**: `--kv-stream --kv-resident-mib 1024 --kv-resident-mib-decode 1536` at `-c 131072` with q8_0 K / q4_0 V loads and serves on Windows/gfx1200 (prefill 381.6 t/s against 419.3 not streaming at the same 2k depth, no stall, no timeout). |
+
+### Context depth is not free on a 16 GB card
+
+Shallow work under a 128K allocation is *not* slower than under a 36K one, so the big allocation
+itself is fine (server harness, 2,025-token prompt, q5_0/q5_0, MTP on):
+
+| `-c` | prefill t/s | decode t/s |
+| --- | --- | --- |
+| 36864 | 418.0 | 47.7 |
+| 69632 | 413.6 | 48.1 |
+| 135168 | 419.3 | 47.3 |
+
+The cost appears as the KV *fills*: the same config falls from 30.1 t/s decode at 92k to 8.2 t/s
+at 131k (prefill 469 -> 176). With 11.28 GiB of weights plus 2.92 GiB of KV at q5_0/q5_0 there is
+about 1.2 GiB left for compute buffers and the MTP draft context, which is where the cliff lives.
+
+### The fix for that cliff is this fork's own `--kv-stream`
+
+Bounding the resident KV and streaming the rest from host RAM buys back the whole prefill loss at
+128K. Server harness, 131,072-token prompt, MTP + ngram-mod, ROCm0, same flags except the pool:
+
+| arm | prefill t/s | decode t/s |
+| --- | --- | --- |
+| q8_0 K / q4_0 V, no streaming (3.45 GiB resident) | 250.2 | 20.02 |
+| **q8_0 K / q4_0 V, `--kv-stream --kv-resident-mib 1024 --kv-resident-mib-decode 1536`** | **531.8 (+113 %)** | **21.40** |
+| q5_0 / q5_0, no streaming | 176.0 | 8.24 |
+
+Two things to note:
+
+* `--kv-stream` requires **q8_0 K and q4_0 V** (`llama-kv-cache.cpp` refuses anything else, and the
+  paged kernels in `fattn-paged-decode-kernel.cuh` / `fattn-prefill-rdna4.cuh` hardcode those block
+  layouts). Supporting a Q5_0 V cache there is the work item that would combine better V quality
+  with streaming: the K side needs nothing, only the V dequant and the type guards.
+* q5_0/q5_0 is *worse than* q8_0/q4_0 at 128K without streaming (8.2 against 20.0 t/s) despite
+  being a **smaller** cache, so the long-context FA path evidently treats the two type combinations
+  differently. Worth measuring before choosing a cache type for depth.
 
 ## What had to become tunable
 
