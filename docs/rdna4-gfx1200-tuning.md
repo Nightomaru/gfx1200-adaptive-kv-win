@@ -33,26 +33,42 @@ The cost appears as the KV *fills*: the same config falls from 30.1 t/s decode a
 at 131k (prefill 469 -> 176). With 11.28 GiB of weights plus 2.92 GiB of KV at q5_0/q5_0 there is
 about 1.2 GiB left for compute buffers and the MTP draft context, which is where the cliff lives.
 
-### The fix for that cliff is this fork's own `--kv-stream`
+### 128K: what the cache type and the streaming pool are actually worth
 
-Bounding the resident KV and streaming the rest from host RAM buys back the whole prefill loss at
-128K. Server harness, 131,072-token prompt, MTP + ngram-mod, ROCm0, same flags except the pool:
+Firm numbers — full **128-token** decode sample (`-c 132096`, so the 131,033-token prompt plus the
+generation cannot overflow the slot), MTP + ngram-mod, ROCm0:
 
-| arm | prefill t/s | decode t/s |
+| arm at 128K | prefill t/s | decode t/s |
 | --- | --- | --- |
-| q8_0 K / q4_0 V, no streaming (3.45 GiB resident) | 250.2 | 20.02 |
-| **q8_0 K / q4_0 V, `--kv-stream --kv-resident-mib 1024 --kv-resident-mib-decode 1536`** | **531.8 (+113 %)** | **21.40** |
-| q5_0 / q5_0, no streaming | 176.0 | 8.24 |
+| q8_0 K / q4_0 V, no streaming | 489.3 | **36.82** |
+| q8_0 K / q4_0 V, `--kv-stream` 1024/1536 | **528.0** | 34.53 |
+| q5_0 / q5_0, no streaming (92k) | 431.0 | 23.27 |
+| q5_0 / q5_0, no streaming (128k) | 176.0 | 8.24 |
 
-Two things to note:
+Two corrections to earlier, shorter measurements:
 
-* `--kv-stream` requires **q8_0 K and q4_0 V** (`llama-kv-cache.cpp` refuses anything else, and the
-  paged kernels in `fattn-paged-decode-kernel.cuh` / `fattn-prefill-rdna4.cuh` hardcode those block
-  layouts). Supporting a Q5_0 V cache there is the work item that would combine better V quality
-  with streaming: the K side needs nothing, only the V dequant and the type guards.
-* q5_0/q5_0 is *worse than* q8_0/q4_0 at 128K without streaming (8.2 against 20.0 t/s) despite
-  being a **smaller** cache, so the long-context FA path evidently treats the two type combinations
-  differently. Worth measuring before choosing a cache type for depth.
+* **Streaming is worth ~+8 % prefill and ~-6 % decode at 128K, not +113 %.** The +113 % came from a
+  *26-token* decode sample: the first tokens after a 131k prefill carry the warm-up, and the
+  no-stream arm is itself unstable run to run (prefill measured 250 then 489 t/s on identical
+  flags). Never conclude from a truncated decode sample, and repeat the no-stream config.
+* **The cache type dominates at depth.** q8_0/q4_0 holds ~35-37 t/s decode at 128K where q5_0/q5_0
+  craters to 8.2 — despite q5_0/q5_0 being the *smaller* cache (2.92 GiB against 3.45). Whatever
+  the long-context FA path does with the two block layouts differs a lot; measure both before
+  choosing a cache type for depth.
+
+Repeats (two runs each, so the numbers above are not a one-off):
+
+| arm, 128K, 128-token samples | prefill t/s | decode t/s |
+| --- | --- | --- |
+| no streaming | 486.2, 504.0 → **495.1** | 39.16, 38.66 → **38.91** |
+| `--kv-stream` 1024/1536 | 530.7, 530.3 → **530.5** | 35.65, 36.30 → **35.98** |
+
+So streaming is a **+7 % prefill / -7 % decode** trade at 128K on this part — it is a capacity
+feature (it is what makes a KV larger than the card's free VRAM possible at all, e.g. 256K or a
+bigger model), not a speed fix for 128K with q8_0/q4_0, because that combination already fits.
+
+Both arms beat the stock 92k reference (431.0 / 23.27) while running 39 % more context: +15 to +23 %
+prefill and +55 to +67 % decode.
 
 ### The tunables: measured at 128K, defaults win
 
@@ -72,6 +88,29 @@ Both failing arms die with `ROCm error: unspecified launch failure` inside
 second of the first compute, i.e. an over-committed allocation rather than a kernel bug. Resident
 pool `2048/3072` fails the same way. **The 64-CU defaults transfer to this part unchanged** — the
 knobs are there to re-measure, not because they needed moving.
+
+## Work item: a better V cache under `--kv-stream`
+
+`--kv-stream` takes q8_0 K and q4_0 V only. The K side is already q8_0 (what the user wanted), so
+the limit is the V side. Two routes, in increasing cost:
+
+**Route 1 — q8_0 V (reuse the K path verbatim).** `PD_Q8_BLK = 34` is what the *K* staging already
+handles, including the scale read at `krow + blk*PD_Q8_BLK`. A q8_0 V variant reuses that dequant
+unchanged and only needs the V layout constants and the two scale-gather sites adjusted
+(`PD_V_ROW` 144 -> 272, `PD_V_VEC` 9 -> 17, `PD_V_LOADS`, the `warp * PD_Q4_BLK` offsets) plus a
+signed-byte fragment gather in place of the nibble tricks. Cache cost at 128K: 4.13 GiB against
+3.45 for q4_0 — and **8.5 bits of V against 4.5**, i.e. better quality than the q5_0 the user asked
+for, for about 0.7 GiB.
+
+**Route 2 — q5_0 V (faithful to the request, more work).** Q5_0's block is 22 bytes (2 d + 4 qh +
+16 qs) and the row is 176 B = 11 x 16 B pieces, both still 16 B aligned, so the staging shape
+survives — but the 5-bit unpack needs its own path: the existing gather is written around Q4_0's
+nibble layout ("high nibble, dt 1") and the piece->block scale trick at `PD_V_ROW` byte 2*v no
+longer lines up. Cache cost at 128K: 3.72 GiB with q8_0 K.
+
+Either route also needs the two guards relaxed: `src/llama-kv-cache.cpp:178` (the throw) and
+`ggml/src/ggml-cuda/fattn-paged-decode.cu:39` (the `supports` test), plus the same treatment in
+`fattn-prefill-rdna4.cuh` for the paged prefill path.
 
 ## What had to become tunable
 
