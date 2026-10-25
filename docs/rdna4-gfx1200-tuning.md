@@ -70,6 +70,16 @@ bigger model), not a speed fix for 128K with q8_0/q4_0, because that combination
 Both arms beat the stock 92k reference (431.0 / 23.27) while running 39 % more context: +15 to +23 %
 prefill and +55 to +67 % decode.
 
+### Host memory: what streaming costs
+
+Streaming keeps the whole KV in **pinned (non-pageable) host RAM** — there is no way around it, the
+host store is where evicted pages live. At 128K with q8_0/q4_0 that is ~3.45 GiB, plus the small
+device-slot ring. On this 16 GB machine free host RAM measured **9.4-9.5 GiB** around every arm of
+the repeat runs (sampled before and after each), so the pool fits with room to spare — and that also
+rules out host-RAM exhaustion as the cause of the one 250 t/s prefill outlier seen earlier. Without
+streaming the KV sits in VRAM and costs host RAM nothing, which is the other half of the trade:
+streaming buys capacity, not speed, at 128K.
+
 ### The tunables: measured at 128K, defaults win
 
 All at `-c 131072 --kv-stream --kv-resident-mib 1024 --kv-resident-mib-decode 1536`, q8_0/q4_0,
