@@ -184,9 +184,12 @@ are mostly rejected, so every verify pass carries more query rows for near-nothi
 worth **+9-11 % decode** over 6.
 
 The upstream `ngram-mod` overrides (n-max 32 / n-min 12 / n-match 24) are a wash at n-max 4 and
-actively hurt at n-max 6 on this workload — but the workload is *varied* prose and code, not the
-repetitive content long ngram matches are for. Re-measure on a real code-editing session before
-dropping them.
+actively hurt at n-max 6 — **on a workload that is ngram-mod's best case**: the harness prompt is
+one fixed ~95-token paragraph repeated to depth (`bench.py` `CORPUS_BLOCK`), so repeated n-grams are
+everywhere and the longer windows still lost. Two caveats cut the other way, though: the decode
+sample is 128 tokens with visible spread (one arm measured 38.1 then 41.5), and a *real* editing
+session differs from a synthetic repeat in both directions. Re-measure both settings on a real
+code-editing session before making the ngram knobs permanent either way.
 
 ## What had to become tunable
 
