@@ -99,28 +99,72 @@ second of the first compute, i.e. an over-committed allocation rather than a ker
 pool `2048/3072` fails the same way. **The 64-CU defaults transfer to this part unchanged** — the
 knobs are there to re-measure, not because they needed moving.
 
-## Work item: a better V cache under `--kv-stream`
+## Done: a q5_1 V cache under `--kv-stream`
 
-`--kv-stream` takes q8_0 K and q4_0 V only. The K side is already q8_0 (what the user wanted), so
-the limit is the V side. Two routes, in increasing cost:
+`--kv-stream` now takes **q8_0 K with q4_0 (V_TAG 0) or q5_1 (V_TAG 1) V**, selected per kernel
+instantiation so the q4_0 path compiles to exactly what it did before. The Q5_1 block is 24 bytes
+(`d, m, qh[4], qs[16]`), so a V row is 192 B = 12 x 16 B pieces — still 16 B aligned, but the Q4_0
+staging trick of reading block *v*'s scale out of 16-byte piece *v* breaks (the pair lives at byte
+24*b), which is where all the work was:
 
-**Route 1 — q8_0 V (reuse the K path verbatim).** `PD_Q8_BLK = 34` is what the *K* staging already
-handles, including the scale read at `krow + blk*PD_Q8_BLK`. A q8_0 V variant reuses that dequant
-unchanged and only needs the V layout constants and the two scale-gather sites adjusted
-(`PD_V_ROW` 144 -> 272, `PD_V_VEC` 9 -> 17, `PD_V_LOADS`, the `warp * PD_Q4_BLK` offsets) plus a
-signed-byte fragment gather in place of the nibble tricks. Cache cost at 128K: 4.13 GiB against
-3.45 for q4_0 — and **8.5 bits of V against 4.5**, i.e. better quality than the q5_0 the user asked
-for, for about 0.7 GiB.
+* `fattn-paged-decode-kernel.cuh` — V_TAG picks the geometry; `PD_Q51_PIECE` maps a 16 B piece to
+  the block whose `d`/`m` pair it carries (byte 0 = x, byte 8 = z, low half = d, high half = m);
+  the 5th bit is gathered from the block's `qh` mask and `V = d*(nibble|bit5<<4) + m` via a new
+  `pd_u5x2` (half(1024 + q5) - 1024, no Q4_0-style -8 bias).
+* `fattn-prefill-rdna4.cuh` — `ppq_load`/`ppq_store` on `V51`: the same `half(1024 + nibble)`
+  idiom carries the 5th bit, so the offset moves 1032 -> 1024 and `m` is added after the scale;
+  `d`/`m`/`qh` read as one 8-byte load per block.
+* `fattn-paged-decode.cu` — the type gate takes q5_1 and both launches branch on `V->type`.
+* `src/llama-kv-cache.cpp:178` — the `--kv-stream` throw now takes a q4_0 *or* q5_1 V cache.
 
-**Route 2 — q5_0 V (faithful to the request, more work).** Q5_0's block is 22 bytes (2 d + 4 qh +
-16 qs) and the row is 176 B = 11 x 16 B pieces, both still 16 B aligned, so the staging shape
-survives — but the 5-bit unpack needs its own path: the existing gather is written around Q4_0's
-nibble layout ("high nibble, dt 1") and the piece->block scale trick at `PD_V_ROW` byte 2*v no
-longer lines up. Cache cost at 128K: 3.72 GiB with q8_0 K.
+Correctness (llama-perplexity, 8 x 2048-token chunks of the fork's own docs):
 
-Either route also needs the two guards relaxed: `src/llama-kv-cache.cpp:178` (the throw) and
-`ggml/src/ggml-cuda/fattn-paged-decode.cu:39` (the `supports` test), plus the same treatment in
-`fattn-prefill-rdna4.cuh` for the paged prefill path.
+| arm | PPL |
+| --- | --- |
+| q5_1 V, stock FA path (no streaming) — reference | 3.9998 |
+| q5_1 V, `--kv-stream` (the new paged kernels) | 3.9946 |
+| q4_0 V, `--kv-stream` (existing path, control) | 4.0002 |
+
+The streamed q5_1 result sits 0.13 % from its own reference — the same magnitude as the
+q4_0-vs-q5_1 *quantisation* difference (0.14 %) — so there is no systematic error; a dropped 5th
+bit or a wrong dim mapping would move PPL by orders of magnitude more.
+
+Speed, 65,536-token prompt + 128 generated, `draft-dflash,ngram-mod --spec-draft-n-max 6`:
+
+| 16k context (no VRAM pressure) | prefill t/s | decode t/s |
+| --- | --- | --- |
+| q8_0 / q4_0, no streaming | 654.9 / 650.0 | 79.3 / 78.9 |
+| q8_0 / q5_1, no streaming | 654.1 / 650.4 | 75.9 / 76.3 |
+| q8_0 / q4_0, `--kv-stream` | 710.9 / 705.3 | 21.1 / 21.1 |
+| q8_0 / q5_1, `--kv-stream` | 706.8 / 707.2 | 21.0 / 20.9 |
+
+| 64k context, `--kv-stream` | prefill t/s | decode t/s |
+| --- | --- | --- |
+| q8_0 / q4_0 | 657.4 / 652.6 | 18.7 / 18.3 |
+| q8_0 / q5_1 | 654.0 / 653.0 | 18.1 / 18.3 |
+
+So: prefill parity everywhere, decode −1 % under streaming and −3-4 % without it — and the KV cost
+of q5_1 is ~+11 % of bytes (24 against 18 per block) for 5.5 bits of V against 4.5.
+
+Two traps measured on the way, both **not** caused by the q5_1 work:
+
+* **A 64k no-streaming run with the DFlash2 draft showed q5_1 prefill at 279 t/s against q4_0's
+  610.** That is a *fit* artefact, not the kernels: with `-md` the fitter cannot measure the draft
+  model's memory (`failed to measure the memory of the extra model, fitting without it`), so the
+  fitted compute buffer is borderline and q5_1's slightly larger KV tips it into a smaller graph.
+  At 16k the same config is at parity (table above), and the streamed 64k runs — same kernel —
+  are at parity too. Keep an eye on the fit warning when combining `-md` with a large `-c`.
+* **`--kv-stream` + a separate draft model (`-md`) deadlocks in decode**: prefill runs to
+  completion, then `wait_for: stalled for 30.0 s waiting for the attention to release a slot
+  (layer 15)` -> `src/llama-kv-stream.cpp:416: KV streaming stalled`. Reproduced on the *untouched
+  q4_0* path at 64k and 128k with 6.5 GiB of free host RAM and under 1 GiB pinned — it is not host
+  RAM exhaustion, and it is not the V type. MTP is unaffected because the draft and target share
+  one context there. Until that is fixed, pair `--kv-stream` with MTP or no speculation, and run
+  the separate-draft configs without streaming.
+
+Still open, in increasing value: **q8_0 V** would reuse the K staging verbatim (34-byte blocks,
+signed bytes, no nibble tricks) for 8.5 bits of V at ~+0.7 GiB over q4_0 at 128k — better quality
+than q5_1, at a higher byte cost.
 
 ## What had to become tunable
 

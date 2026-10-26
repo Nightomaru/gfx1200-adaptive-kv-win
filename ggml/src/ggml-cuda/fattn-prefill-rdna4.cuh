@@ -259,8 +259,8 @@ static __device__ __forceinline__ void ppq_store(const ppq_raw & r, const int ti
 // mask + t * mask_nb1 (bytes) + 2 (k - mask_start), keys before mask_start visible; may be null.
 // dst: f32 [n_q][n_heads][PP_D]; lse: f32 [n_q][n_heads], natural log.
 // 6 waves per SIMD (at most 240 VGPRs): two blocks per WGP
-__launch_bounds__(PP_NW * 32, 6)
 template <bool V51>
+__launch_bounds__(PP_NW * 32, 6)
 static __global__ void pp_attn_q(
         const char * __restrict__ Q, const int64_t q_nb1, const int64_t q_nb2,
         const char * __restrict__ K, const int64_t k_nb1, const int64_t k_nb2,
