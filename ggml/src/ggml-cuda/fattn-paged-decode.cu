@@ -36,7 +36,8 @@ static bool pd_shapes_ok(int device, const ggml_tensor * dst, int64_t max_nb) {
     float params[3];
     memcpy(params, dst->op_params, sizeof(params)); // scale, max_bias, logit_softcap
     if (!GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc)) return false;
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q4_0) return false;
+    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_Q8_0 ||
+        (V->type != GGML_TYPE_Q4_0 && V->type != GGML_TYPE_Q5_1)) return false;
     if (Q->ne[0] != PD_D || K->ne[0] != PD_D || V->ne[0] != PD_D) return false;
     if (Q->ne[1] < 1 || Q->ne[1] > max_nb || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) return false;
     if (K->ne[2] < 1 || Q->ne[2] != PD_GQA * K->ne[2] || V->ne[2] != K->ne[2] || V->ne[1] != K->ne[1]) return false;
@@ -267,20 +268,24 @@ void ggml_cuda_flash_attn_ext_paged_decode(ggml_backend_cuda_context & ctx, ggml
     // the kernel indexes mask rows by K/V column
     const char * mask_data = mask ? (const char *) mask->data - (ptrdiff_t) mask_col0*sizeof(half) : nullptr;
     const int64_t mask_nb1 = mask ? mask->nb[1] : 0;
-#define PD_LAUNCH(M, P, MT) \
-    pd_partial<M, P, MT><<<grid, PD_NWARPS * 32, 0, stream>>>((const char *) Q->data, Q->nb[1], Q->nb[2], kv_k, kv_v, sync, \
+#define PD_LAUNCH(M, P, MT, V51) \
+    pd_partial<M, P, MT, V51><<<grid, PD_NWARPS * 32, 0, stream>>>((const char *) Q->data, Q->nb[1], Q->nb[2], kv_k, kv_v, sync, \
         mask_data, mask_nb1, mask_col0, scale, n_kv, nb, n_chunks, chunks_per_split, O_part, ML_part)
+    // V_TAG is a compile-time kernel parameter, so the launch branches on the (uniform) V type
+#define PD_LAUNCH_V(M, P, MT) \
+    do { if (V->type == GGML_TYPE_Q5_1) { PD_LAUNCH(M, P, MT, true); } else { PD_LAUNCH(M, P, MT, false); } } while (0)
     if (n_tiles > 1) {
         // a 32-row tile spans at most 7 query tokens
-        if (pages) { PD_LAUNCH(2, true, 8); } else { PD_LAUNCH(2, false, 8); }
+        if (pages) { PD_LAUNCH_V(2, true, 8); } else { PD_LAUNCH_V(2, false, 8); }
     } else if (M_TILES == 1) {
-        if (pages) { PD_LAUNCH(1, true, 4); } else { PD_LAUNCH(1, false, 4); }
+        if (pages) { PD_LAUNCH_V(1, true, 4); } else { PD_LAUNCH_V(1, false, 4); }
     } else if (nb <= 4) {
-        if (pages) { PD_LAUNCH(2, true, 4); } else { PD_LAUNCH(2, false, 4); }
+        if (pages) { PD_LAUNCH_V(2, true, 4); } else { PD_LAUNCH_V(2, false, 4); }
     } else {
         // 5 query tokens (30 rows) in one 32-row tile
-        if (pages) { PD_LAUNCH(2, true, 8); } else { PD_LAUNCH(2, false, 8); }
+        if (pages) { PD_LAUNCH_V(2, true, 8); } else { PD_LAUNCH_V(2, false, 8); }
     }
+#undef PD_LAUNCH_V
 #undef PD_LAUNCH
     CUDA_CHECK(cudaGetLastError());
     pd_combine<<<dim3(nb * PD_GQA, n_heads), PD_D, 0, stream>>>(O_part, ML_part, n_splits, n_tiles * R,
@@ -343,11 +348,14 @@ void ggml_cuda_flash_attn_ext_paged_prefill(ggml_backend_cuda_context & ctx, ggm
             const dim3 grid((unsigned) ((n_q + PP_BQ - 1) / PP_BQ), (unsigned) part.k.ne[2], 1);
             const char * mask_data = part.dst.src[3] ? (const char *) part.mask.data : nullptr;
             const int64_t mask_nb1 = part.dst.src[3] ? part.mask.nb[1] : 0;
-            pp_attn_q<<<grid, PP_NW * 32, 0, stream>>>(
-                (const char *) Q->data, Q->nb[1], Q->nb[2],
-                (const char *) part.k.data, part.k.nb[1], part.k.nb[2],
-                (const char *) part.v.data, part.v.nb[1], part.v.nb[2],
-                mask_data, mask_nb1, part.mask_start, (float *) part_out, part_lse, (int) n_q, (int) n_tok, (int) Q->ne[2], scale);
+#define PP_LAUNCH(V51) \
+            pp_attn_q<V51><<<grid, PP_NW * 32, 0, stream>>>( \
+                (const char *) Q->data, Q->nb[1], Q->nb[2], \
+                (const char *) part.k.data, part.k.nb[1], part.k.nb[2], \
+                (const char *) part.v.data, part.v.nb[1], part.v.nb[2], \
+                mask_data, mask_nb1, part.mask_start, (float *) part_out, part_lse, (int) n_q, (int) n_tok, (int) Q->ne[2], scale)
+            if (part.v.type == GGML_TYPE_Q5_1) { PP_LAUNCH(true); } else { PP_LAUNCH(false); }
+#undef PP_LAUNCH
             CUDA_CHECK(cudaGetLastError());
         } else {
             // the stock kernels get a mask of all the part's columns (one that writes the log-sum-exp may need one)
