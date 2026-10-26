@@ -166,6 +166,28 @@ Still open, in increasing value: **q8_0 V** would reuse the K staging verbatim (
 signed bytes, no nibble tricks) for 8.5 bits of V at ~+0.7 GiB over q4_0 at 128k — better quality
 than q5_1, at a higher byte cost.
 
+### Draft depth beats draft length: `--spec-draft-n-max 4`, not 6
+
+DFlash2 + `ngram-mod` at 64k, q5_1 V streamed, 2 runs per arm (128 generated tokens; prefill is
+~620 t/s in every arm, so only decode moves):
+
+| draft settings | decode t/s | acceptance | mean accepted |
+| --- | --- | --- | --- |
+| `--spec-draft-n-max 4` + upstream `ngram-mod` 32/12/24 | **39.80** (38.1 / 41.5) | 0.831 | 6.68 |
+| `--spec-draft-n-max 4`, default `ngram-mod` | 38.96 (39.2 / 38.7) | 0.831 | 7.00 |
+| `--spec-draft-n-max 6`, default `ngram-mod` | 36.00 (36.1 / 35.9) | 0.782 | 8.40 |
+| `--spec-draft-n-max 6` + upstream `ngram-mod` | 33.34 (33.4 / 33.3) | 0.736 | 7.41 |
+
+The mechanism is in the acceptance counters: at n-max 6 the *rate* drops (0.78/0.74 against 0.83)
+while the mean accepted length gains little (7.4-8.4 against 6.7-7.0) — the deeper draft positions
+are mostly rejected, so every verify pass carries more query rows for near-nothing. n-max 4 is
+worth **+9-11 % decode** over 6.
+
+The upstream `ngram-mod` overrides (n-max 32 / n-min 12 / n-match 24) are a wash at n-max 4 and
+actively hurt at n-max 6 on this workload — but the workload is *varied* prose and code, not the
+repetitive content long ngram matches are for. Re-measure on a real code-editing session before
+dropping them.
+
 ## What had to become tunable
 
 Each of these was a constant measured on a 64-CU part. The default is unchanged, so a gfx1201
