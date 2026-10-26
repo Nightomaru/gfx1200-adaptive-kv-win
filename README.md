@@ -10,9 +10,9 @@ This fork takes [achyudh/llama.cpp](https://github.com/achyudh/llama.cpp/tree/fe
 
 - **Native Windows port of the KV-stream stack.** The upstream copy engine assumes the Linux HSA runtime, which AMD does not ship on Windows. Ported to a HIP stream+event copy path behind `GGML_HIP_HSA_COPY_ENGINE`, after verifying that `hipHostMalloc` is identity-mapped and host-write-coherent on gfx1200/WDDM — so the host-pointer page design works without modification.
 - **gfx1200 as a first-class target.** Built for `GPU_TARGETS=gfx1200` (32 CU / 16 WGP); the RDNA4 launch-size heuristics written for the 64-CU 9070 XT were re-measured on the smaller part.
-- **A current TheRock ROCm.** Built with `therock-dist-windows-gfx120X-all-10.3.0a20261025` (AMD clang 24). Measured: the identical code on a stale SDK (clang 23) lost ~40 % prefill — on Windows the SDK version matters more than any flag.
-- **DFlash2 draft decoding on Windows.** `--spec-type draft-dflash,ngram-mod` with a separate draft GGUF (`-md` / `--model-draft`), verified coherent at long context with high draft acceptance (0.74-0.98 across measured workloads).
-- **q8_0 K / q5_1 V KV streaming.** New paged decode *and* prefill kernel variants for Q5_1's 24-byte block (5-bit unpack plus per-block offset), selected at compile time so the q4_0 path compiles unchanged. Perplexity 3.9946 against 3.9998 on the stock-FA q5_1 reference; prefill/decode at parity with the q4_0 streamed cache.
+- **A current TheRock ROCm.** Built with `therock-dist-windows-gfx120X-all-10.3.0a20261025` (AMD clang 24).
+- **DFlash2 speculative draft.** `--spec-type draft-dflash,ngram-mod` with a separate draft GGUF (`-md` / `--model-draft`).
+- **q8_0 K / q5_1 V KV streaming.** New paged decode *and* prefill kernel variants for Q5_1's 24-byte block (5-bit unpack plus per-block offset), selected at compile time so the q4_0 path compiles unchanged.
 
 ## Setup (Windows)
 
@@ -48,7 +48,7 @@ This fork takes [achyudh/llama.cpp](https://github.com/achyudh/llama.cpp/tree/fe
 
 ## Quick start: `llama-server`
 
-A serving configuration that ran clean at 128K on the 16 GB card (paths anonymized):
+A serving configuration that ran clean at 128K on the 16 GB card:
 
 ```bat
 llama-server.exe ^
@@ -71,10 +71,10 @@ llama-server.exe ^
   --poll-batch 1 ^
   --load-mode dio ^
   --jinja ^
-  --model-draft "C:\path\to\Dependencies\Qwen3.8-27B-DFlash2-Q4_K_M.gguf" ^
+  --model-draft "C:\path\to\Qwen3.8-27B-DFlash2-Q4_K_M.gguf" ^
   --spec-type draft-dflash,ngram-mod ^
   -ngld all ^
-  --spec-draft-n-max 4 ^
+  --spec-draft-n-max 6 ^
   --spec-rs-replay ^
   --reasoning on ^
   --temp 1 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0 --repeat-penalty 1.0 ^
