@@ -76,7 +76,7 @@ struct ppq_raw {
 typedef uint64_t ppq_u64_a2 __attribute__((aligned(2)));
 typedef uint16_t ppq_u16_a2 __attribute__((aligned(2)));
 
-// q8_0 / q4_0 blocks are 2-byte aligned (34 and 18 bytes)
+// q8_0 / q4_0 / q5_1 blocks are 2-byte aligned (34, 18 and 24 bytes)
 static __device__ __forceinline__ uint2 ppq_ld8(const char * p) {
     const uint64_t v = *(const ppq_u64_a2 *) p;
     return make_uint2((uint32_t) v, (uint32_t) (v >> 32));
@@ -88,8 +88,11 @@ static __device__ __forceinline__ int ppq_vi(const int tid, const int j) {
     return (tid + PPQ_NT - PPQ_K3) % PPQ_NT + j * PPQ_NT;
 }
 
+template <bool V51>
 static __device__ __forceinline__ void ppq_load(ppq_raw & r, const int tid, const int kv0, const int n_kv,
         const char * Kh, const int64_t k_nb1, const char * Vh, const int64_t v_nb1) {
+    constexpr int V_BB = V51 ? 24 : 18; // V block bytes
+    constexpr int V_QS = V51 ? 8 : 2;   // where the 4-bit quants start inside a block
 #pragma unroll
     for (int j = 0; j < PPQ_KP; ++j) {
         const int i = tid + j * PPQ_NT;
@@ -109,7 +112,7 @@ static __device__ __forceinline__ void ppq_load(ppq_raw & r, const int tid, cons
             const int k = kv0 + 2 * kp + e;
             r.vq[j][e] = make_uint2(0, 0);
             if (i < (PP_TILE / 2) * (PP_D / 8) && k < n_kv) {
-                r.vq[j][e] = ppq_ld8(Vh + (int64_t) kv0 * v_nb1 + ((2 * kp + e) * (int) v_nb1 + 18 * (g / 4) + 2 + 8 * (g % 2)));
+                r.vq[j][e] = ppq_ld8(Vh + (int64_t) kv0 * v_nb1 + ((2 * kp + e) * (int) v_nb1 + V_BB * (g / 4) + V_QS + 8 * (g % 2)));
             }
         }
     }
@@ -122,14 +125,20 @@ static __device__ __forceinline__ pp_half2 ppq_h2(const uint32_t w, const uint32
 
 // The scales and the mask are read here, from cache lines the prefetch brought in. The reads are unconditional (indices
 // clamped, values selected after) so that they are issued together: guarded reads become branches, each with a wait.
+template <bool V51>
 static __device__ __forceinline__ void ppq_store(const ppq_raw & r, const int tid, const int kv0, const int n_kv,
         const int n_q, const int q0, const char * Kh, const int64_t k_nb1, const char * Vh, const int64_t v_nb1,
         const char * mask, const int64_t mask_nb1, const int mask_start, _Float16 * sK, _Float16 * sV, _Float16 * sM) {
+    constexpr int V_BB = V51 ? 24 : 18; // V block bytes
     const char * Kt = Kh + (int64_t) kv0 * k_nb1;
     const char * Vt = Vh + (int64_t) kv0 * v_nb1;
     const int    kl = n_kv - 1 - kv0; // last valid key of the tile
 
     uint16_t kd[PPQ_KP], vd[PPQ_VP][2], md[PPQ_MP];
+    // Q5_1 only (size 1 keeps the Q4_0 instantiation's registers unchanged): the block's offset m and the
+    // 5th-bit mask qh, both read with d in one 8 B load.
+    uint16_t vm[V51 ? PPQ_VP * 2 : 1];
+    uint32_t vh[V51 ? PPQ_VP * 2 : 1];
 #pragma unroll
     for (int j = 0; j < PPQ_KP; ++j) {
         const int i = min(tid + j * PPQ_NT, PP_TILE * (PP_D / 8) - 1);
@@ -142,7 +151,15 @@ static __device__ __forceinline__ void ppq_store(const ppq_raw & r, const int ti
         const int kp = i % (PP_TILE / 2), g = i / (PP_TILE / 2);
 #pragma unroll
         for (int e = 0; e < 2; ++e) {
-            vd[j][e] = *(const ppq_u16_a2 *) (Vt + (min(2 * kp + e, kl) * (int) v_nb1 + 18 * (g / 4)));
+            if constexpr (V51) {
+                // d and m are the block's leading half2 and qh the 4 bytes after it: 8 B aligned in a 24 B block
+                const uint2 dm = ppq_ld8(Vt + (min(2 * kp + e, kl) * (int) v_nb1 + V_BB * (g / 4)));
+                vd[j][e]       = (uint16_t) dm.x;
+                vm[j * 2 + e]  = (uint16_t) (dm.x >> 16);
+                vh[j * 2 + e]  = dm.y;
+            } else {
+                vd[j][e] = *(const ppq_u16_a2 *) (Vt + (min(2 * kp + e, kl) * (int) v_nb1 + V_BB * (g / 4)));
+            }
         }
     }
     if (mask) {
@@ -183,12 +200,34 @@ static __device__ __forceinline__ void ppq_store(const ppq_raw & r, const int ti
             for (int e = 0; e < 2; ++e) {
                 const uint16_t d = 2 * kp + e <= kl ? vd[j][e] : 0;
                 const pp_half2 d2  = __builtin_bit_cast(pp_half2, (uint32_t) d * 0x10001u);
-                const pp_half2 off = {(_Float16) 1032.0f, (_Float16) 1032.0f};
                 const uint32_t w0 = r.vq[j][e].x >> shift, w1 = r.vq[j][e].y >> shift;
-                pk[e][0] = __builtin_bit_cast(uint32_t, (ppq_h2(w0, 0x0c010c00u, 0x000F000Fu) - off) * d2);
-                pk[e][1] = __builtin_bit_cast(uint32_t, (ppq_h2(w0, 0x0c030c02u, 0x000F000Fu) - off) * d2);
-                pk[e][2] = __builtin_bit_cast(uint32_t, (ppq_h2(w1, 0x0c010c00u, 0x000F000Fu) - off) * d2);
-                pk[e][3] = __builtin_bit_cast(uint32_t, (ppq_h2(w1, 0x0c030c02u, 0x000F000Fu) - off) * d2);
+                if constexpr (V51) {
+                    // Q5_1: q5 = nibble | bit5 << 4 and V = d * q5 + m. OR-ing 0x0010 into the 1024 + nibble
+                    // mantissa carries the 5th bit for free; m is a per-block offset added after the scale.
+                    const uint16_t m = 2 * kp + e <= kl ? vm[j * 2 + e] : 0;
+                    const uint32_t qh = vh[j * 2 + e];
+                    const pp_half2 m2  = __builtin_bit_cast(pp_half2, (uint32_t) m * 0x10001u);
+                    const pp_half2 off = {(_Float16) 1024.0f, (_Float16) 1024.0f};
+                    const int b = 8 * (g % 4); // dims of this group inside their own block
+                    const uint32_t h0 = (((qh >> (b + 0)) & 1u) << 4) | (((qh >> (b + 1)) & 1u) << 20);
+                    const uint32_t h1 = (((qh >> (b + 2)) & 1u) << 4) | (((qh >> (b + 3)) & 1u) << 20);
+                    const uint32_t h2 = (((qh >> (b + 4)) & 1u) << 4) | (((qh >> (b + 5)) & 1u) << 20);
+                    const uint32_t h3 = (((qh >> (b + 6)) & 1u) << 4) | (((qh >> (b + 7)) & 1u) << 20);
+                    const uint32_t p0 = __builtin_bit_cast(uint32_t, ppq_h2(w0, 0x0c010c00u, 0x000F000F)) | h0;
+                    const uint32_t p1 = __builtin_bit_cast(uint32_t, ppq_h2(w0, 0x0c030c02u, 0x000F000F)) | h1;
+                    const uint32_t p2 = __builtin_bit_cast(uint32_t, ppq_h2(w1, 0x0c010c00u, 0x000F000F)) | h2;
+                    const uint32_t p3 = __builtin_bit_cast(uint32_t, ppq_h2(w1, 0x0c030c02u, 0x000F000F)) | h3;
+                    pk[e][0] = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(pp_half2, p0) - off) * d2 + m2);
+                    pk[e][1] = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(pp_half2, p1) - off) * d2 + m2);
+                    pk[e][2] = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(pp_half2, p2) - off) * d2 + m2);
+                    pk[e][3] = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(pp_half2, p3) - off) * d2 + m2);
+                } else {
+                    const pp_half2 off = {(_Float16) 1032.0f, (_Float16) 1032.0f};
+                    pk[e][0] = __builtin_bit_cast(uint32_t, (ppq_h2(w0, 0x0c010c00u, 0x000F000F) - off) * d2);
+                    pk[e][1] = __builtin_bit_cast(uint32_t, (ppq_h2(w0, 0x0c030c02u, 0x000F000F) - off) * d2);
+                    pk[e][2] = __builtin_bit_cast(uint32_t, (ppq_h2(w1, 0x0c010c00u, 0x000F000F) - off) * d2);
+                    pk[e][3] = __builtin_bit_cast(uint32_t, (ppq_h2(w1, 0x0c030c02u, 0x000F000F) - off) * d2);
+                }
             }
             // transposed: dim rows, a key pair per dword
 #pragma unroll
@@ -221,6 +260,7 @@ static __device__ __forceinline__ void ppq_store(const ppq_raw & r, const int ti
 // dst: f32 [n_q][n_heads][PP_D]; lse: f32 [n_q][n_heads], natural log.
 // 6 waves per SIMD (at most 240 VGPRs): two blocks per WGP
 __launch_bounds__(PP_NW * 32, 6)
+template <bool V51>
 static __global__ void pp_attn_q(
         const char * __restrict__ Q, const int64_t q_nb1, const int64_t q_nb2,
         const char * __restrict__ K, const int64_t k_nb1, const int64_t k_nb2,
@@ -251,7 +291,7 @@ static __global__ void pp_attn_q(
     const char * Vh = V + (int64_t) kvh * v_nb2;
 
     ppq_raw raw;
-    ppq_load(raw, tid, 0, n_kv, Kh, k_nb1, Vh, v_nb1);
+    ppq_load<V51>(raw, tid, 0, n_kv, Kh, k_nb1, Vh, v_nb1);
 
     // Q fragments: dims 16 * ks + 8 * h + 0..7 of this lane's row, in base-2 logit units
     pp_half8 qf[PP_D / 16];
@@ -276,11 +316,11 @@ static __global__ void pp_attn_q(
     float l_run = 0.0f;      // the sum of p over this lane's keys
 
     for (int kv0 = 0; kv0 < n_kv; kv0 += PP_TILE) {
-        ppq_store(raw, tid, kv0, n_kv, n_q, q0, Kh, k_nb1, Vh, v_nb1, mask, mask_nb1, mask_start, sK, sV, sM);
+        ppq_store<V51>(raw, tid, kv0, n_kv, n_q, q0, Kh, k_nb1, Vh, v_nb1, mask, mask_nb1, mask_start, sK, sV, sM);
         pp_lds_barrier();
         // the next tile's loads are in flight during this tile's math
         if (kv0 + PP_TILE < n_kv) {
-            ppq_load(raw, tid, kv0 + PP_TILE, n_kv, Kh, k_nb1, Vh, v_nb1);
+            ppq_load<V51>(raw, tid, kv0 + PP_TILE, n_kv, Kh, k_nb1, Vh, v_nb1);
         }
 
 #pragma unroll
