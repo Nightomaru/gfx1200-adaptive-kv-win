@@ -42,7 +42,7 @@ This fork takes [achyudh/llama.cpp](https://github.com/achyudh/llama.cpp/tree/fe
      -DGGML_HIP=ON -DGGML_HIP_NO_VMM=ON -DGGML_HIP_HSA_COPY_ENGINE=OFF ^
      -DGGML_OPENMP=OFF -DGGML_RPC=ON -DGGML_NATIVE=OFF -DGGML_STATIC=OFF ^
      -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_BMI2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
-     -DGGML_CUDA_FA_QUANTS="q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;q8_0-q4_0;q5_0-q5_0;q5_1-q5_1;q8_0-q5_0;q5_0-q5_1;q4_0-q5_0;q8_0-q5_1"
+     -DGGML_CUDA_FA_QUANTS="bf16-bf16;f16-f16;q8_0-q8_0;q8_0-q5_1;q8_0-q5_0;q8_0-q4_1;q8_0-q4_0;q5_1-q5_1;q5_1-q5_0;q5_1-q4_1;q5_1-q4_0;q5_0-q5_0;q5_0-q4_1;q5_0-q4_0;q4_1-q4_1;q4_0-q4_0"
    cmake --build build -j 8
    ```
 
