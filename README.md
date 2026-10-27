@@ -35,14 +35,23 @@ This fork takes [achyudh/llama.cpp](https://github.com/achyudh/llama.cpp/tree/fe
      -DCMAKE_MAKE_PROGRAM "<vs>\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe" ^
      -DCMAKE_C_COMPILER "<rocm>\lib\llvm\bin\clang.exe" ^
      -DCMAKE_CXX_COMPILER "<rocm>\lib\llvm\bin\clang++.exe" ^
+     -DCMAKE_RC_COMPILER "C:\Program Files (x86)\Windows Kits\10\bin\<ver>\x64\rc.exe" ^
      -DCMAKE_HIP_FLAGS "--rocm-path=<rocm>" ^
-     -DCMAKE_CROSSCOMPILING=ON -DCMAKE_SYSTEM_NAME=Windows ^
+     -DCMAKE_PREFIX_PATH "<rocm>" ^
      -DCMAKE_BUILD_TYPE=Release -DGPU_TARGETS=gfx1200 -DBUILD_SHARED_LIBS=ON ^
      -DGGML_HIP=ON -DGGML_HIP_NO_VMM=ON -DGGML_HIP_HSA_COPY_ENGINE=OFF ^
      -DGGML_OPENMP=OFF -DGGML_RPC=ON -DGGML_NATIVE=OFF -DGGML_STATIC=OFF ^
+     -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_BMI2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
      -DGGML_CUDA_FA_QUANTS="q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;q8_0-q4_0;q5_0-q5_0;q5_1-q5_1;q8_0-q5_0;q5_0-q5_1;q4_0-q5_0;q8_0-q5_1"
    cmake --build build -j 8
    ```
+
+   Do **not** pass `-DCMAKE_SYSTEM_NAME=Windows` / `-DCMAKE_CROSSCOMPILING=ON` for a native build:
+   with Ninja they leave `CMAKE_SYSTEM_PROCESSOR` empty, ggml's arch detection fails, and the CPU
+   backend silently falls back to `GGML_CPU_GENERIC` (SSE2 only, all `GGML_SSE42/AVX/AVX2/FMA/F16C`
+   options ignored). The x86 flags above matter for `--no-mmproj-offload`: the vision encoder then
+   runs on `ggml-cpu`, and measured on the Qwen3.8-27B F16 mmproj, generic built 46 s per image vs
+   2.5 s with AVX2/FMA/F16C (Zen 5, 12 threads).
 
 4. Run the binaries with `<rocm>\bin` on `PATH`, or copy the runtime DLLs beside them.
 
