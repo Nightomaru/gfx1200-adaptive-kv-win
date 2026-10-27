@@ -64,8 +64,8 @@ llama-server.exe ^
   -np 1 ^
   -fa on ^
   --kv-stream ^
-  --kv-resident-mib 512 ^
-  --kv-resident-mib-decode 1536 ^
+  --kv-resident-mib 256 ^
+  --kv-resident-mib-decode 480 ^
   --prio 2 ^
   --prio-batch 2 ^
   --poll-batch 1 ^
@@ -74,7 +74,7 @@ llama-server.exe ^
   --model-draft "C:\path\to\Qwen3.8-27B-DFlash2-Q4_K_M.gguf" ^
   --spec-type draft-dflash,ngram-mod ^
   -ngld all ^
-  --spec-draft-n-max 6 ^
+  --spec-draft-n-max 4 ^
   --spec-rs-replay ^
   --reasoning on ^
   --temp 1 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0 --repeat-penalty 1.0 ^
