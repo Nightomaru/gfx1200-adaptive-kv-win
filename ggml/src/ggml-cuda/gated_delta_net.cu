@@ -634,14 +634,13 @@ static void ggml_cuda_op_gated_delta_net_impl(
     }
 
     if (s_ids == nullptr) {
+        // v16's MMA kernel: it reads the initial state from src[5] (from_tensor) and writes the
+        // per-slot output state; the fork's scratch/state_ids variant assumed the fork-era state
+        // layout and produced garbage under v16's op conventions.  Batches with state ids
+        // (state-rows gather) fall through to the template kernel, which handles them.
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
-        args.state            = s_d;
-        args.state_out        = state_d;
-        args.state_ids        = s_ids;
-        args.state_row_stride = s_row_stride;
-        // the MMA path's scratch follows dst (ggml_cuda_gated_delta_net_get_alloc_size)
-        void * scratch = (char *) dst->data + GGML_PAD(ggml_nbytes(dst), 256);
-        if (ggml_cuda_gdn_mma_launch(scratch, ctx.device, args, stream)) {
+        args.state_out = state_d;
+        if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
             return;
         }
     }
@@ -666,11 +665,6 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride, ra, stream);
         }
     }
-}
-
-size_t ggml_cuda_gated_delta_net_get_alloc_size(int device, const ggml_tensor * dst) {
-    const size_t scratch = ggml_cuda_gdn_mma_scratch_size(device, ggml_cuda_gdn_mma_args_from_tensor(dst));
-    return scratch > 0 ? GGML_PAD(ggml_nbytes(dst), 256) + scratch : ggml_nbytes(dst);
 }
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
