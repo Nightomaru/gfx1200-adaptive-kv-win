@@ -1716,8 +1716,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t band  = 0;
     std::vector<int> n_hard;  // [n_seq] the hard cap of this call: --spec-draft-n-max and the caller's n_max
 
-    common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq, bool adaptive = false, bool align = true)
-        : common_speculative_impl(adaptive ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE : COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
     // Single head (qwen35): the catch-up decode of the batch that verifies a draft waits for the next draft() and
     // runs in its first step, for the rows accept() keeps, so the MTP layer runs once instead of twice. A process()
     // call that comes first decodes the kept rows below its own first position and drops the rest (a checkpoint
@@ -1734,8 +1732,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int32_t>                   defer_keep; // [n_seq] rows to keep, set by accept(); -1: all
     std::vector<std::vector<float>>        flush_h;    // [n_seq] the rows' hidden data while their decode is pending
 
-    common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+    common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq, bool adaptive = false, bool align = true)
+        : common_speculative_impl(adaptive ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE : COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -2148,7 +2146,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 n_rows  = 1;
             }
             verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_keep * n_embd);
+            verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
                 const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_row0 + i);

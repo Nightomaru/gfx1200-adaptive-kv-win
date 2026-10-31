@@ -25,7 +25,6 @@ public:
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
                      uint32_t   n_rs_batch,
-        const layer_filter_cb & filter);
         const layer_filter_cb & filter,
                      uint32_t   n_rs_rec = 0);
 

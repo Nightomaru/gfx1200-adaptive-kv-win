@@ -501,6 +501,17 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // hipErrorIllegalState, llama-cpp-rdna-boosts#2); a rejected launch has no side effects, so we
     // recompute with the sequential kernel below, bit-identical to GGML_CUDA_GDN_CHUNKED=0.  An
     // async fault inside a launched kernel is NOT caught here and surfaces at the next sync point.
+    gdn_rec_args ra;
+    if (dst->src[6] != nullptr) {
+        const ggml_tensor * rec = dst->src[6];
+        ra.rec      = (float *) rec->data;
+        ra.rec_seq  = (int64_t) (rec->nb[1] / sizeof(float));
+        ra.n_commit = (const int32_t *) dst->src[7]->data;
+        ra.record   = ggml_get_op_params_i32(dst, 1) != 0;
+        ra.R        = ggml_get_op_params_i32(dst, 2);
+        ra.H_k      = (int) src_k->ne[1];
+    }
+
     if (!kda && n_tokens > 1 &&
         (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
         // read once as a value: a cached getenv() pointer is unsafe on Windows (the CRT buffer is reused)
@@ -508,6 +519,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
             const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
             return env == nullptr || strcmp(env, "0") != 0;
         }();
+
         if (chunked_on) {
             // Threshold for the chunked path: a batch above it is chunked on its first
             // n_tokens - D tokens and finished by the sequential tail.  A constant for K <= 16 (see
@@ -577,12 +589,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
                                 launch_gated_delta_net<false, true>(q_t, k_t, v_t, g_t, b_t, tail_base,
                                     dst_t, tail_base, S_v, H, D, n_seqs,
                                     sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
-                                    scale, slot_stride, K, beta_sigmoid, s_ids, s_row_stride, stream);
+                                    scale, slot_stride, K, beta_sigmoid, s_ids, s_row_stride, ra, stream);
                             } else {
                                 launch_gated_delta_net<false, false>(q_t, k_t, v_t, g_t, b_t, tail_base,
                                     dst_t, tail_base, S_v, H, D, n_seqs,
                                     sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
-                                    scale, slot_stride, K, beta_sigmoid, s_ids, s_row_stride, stream);
+                                    scale, slot_stride, K, beta_sigmoid, s_ids, s_row_stride, ra, stream);
                             }
                         }
                         static bool logged_free = false;
@@ -621,23 +633,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
-    gdn_rec_args ra;
-    if (dst->src[6] != nullptr) {
-        const ggml_tensor * rec = dst->src[6];
-        ra.rec      = (float *) rec->data;
-        ra.rec_seq  = (int64_t) (rec->nb[1] / sizeof(float));
-        ra.n_commit = (const int32_t *) dst->src[7]->data;
-        ra.record   = ggml_get_op_params_i32(dst, 1) != 0;
-        ra.R        = ggml_get_op_params_i32(dst, 2);
-        ra.H_k      = (int) src_k->ne[1];
-    }
-
-    if (state_ids == nullptr) {
+    if (s_ids == nullptr) {
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
         args.state            = s_d;
         args.state_out        = state_d;
-        args.state_ids        = state_ids;
-        args.state_row_stride = state_row_stride;
+        args.state_ids        = s_ids;
+        args.state_row_stride = s_row_stride;
         // the MMA path's scratch follows dst (ggml_cuda_gated_delta_net_get_alloc_size)
         void * scratch = (char *) dst->data + GGML_PAD(ggml_nbytes(dst), 256);
         if (ggml_cuda_gdn_mma_launch(scratch, ctx.device, args, stream)) {

@@ -1135,33 +1135,23 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
-/* fused add + softplus + mul (the gate of a gated delta net) */
-
-static __global__ void add_softplus_mul_f32(const float * x, const float * bias, const float * scale, float * dst,
-                                            const int64_t k, const int64_t ncols) {
-    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
-    if (i >= k) {
-        return;
+// GDN gate chain (verify band): ADD(dt) -> SOFTPLUS -> MUL(a) with per-head broadcasts, one kernel.
+// Returns 2 when fused, 0 otherwise.  GGML_CUDA_FUSE_GDN_GATE=0 turns it off.
+int ggml_cuda_add_softplus_mul_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool fuse_gdn_gate = getenv("GGML_CUDA_FUSE_GDN_GATE") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_GATE")) != 0;
+    ggml_tensor * node = cgraph->nodes[i];
+    if (!fuse_gdn_gate || node->op != GGML_OP_ADD || i + 2 >= cgraph->n_nodes ||
+            cgraph->nodes[i + 1]->op != GGML_OP_UNARY || cgraph->nodes[i + 2]->op != GGML_OP_MUL ||
+            !ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }) ||
+            !ggml_cuda_op_add_softplus_mul(ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        return 0;
     }
-    const int64_t c = i % ncols;
-    dst[i] = op_softplus(x[i] + bias[c]) * scale[c];
+    return 2;
 }
 
-void ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * unary_node, ggml_tensor * mul_node) {
-    const ggml_tensor * x     = add_node->src[0];
-    const ggml_tensor * bias  = add_node->src[1];
-    const ggml_tensor * scale = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
-
-    const int64_t k     = ggml_nelements(mul_node);
-    const int64_t ncols = x->ne[0];
-    const int     num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
-    add_softplus_mul_f32<<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream()>>>(
-        (const float *) x->data, (const float *) bias->data, (const float *) scale->data, (float *) mul_node->data, k, ncols);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-/* fused relu + sqr */
-
+// scale -> silu/sigmoid unary (qwen4exp hyper-connection low-rank gate, e.g. silu(x / hc) in
+// build_hc_mix's prefill path): apply the activation while scaling.  Numerically identical
+// (same per-element expression).  Opt-out: GGML_CUDA_SCALE_UNARY=0.
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {
     const ggml_tensor * src = relu_node->src[0];
     cudaStream_t stream = ctx.stream();
@@ -1245,23 +1235,6 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
     }
 }
 
-// GDN gate chain (verify band): ADD(dt) -> SOFTPLUS -> MUL(a) with per-head broadcasts, one kernel.
-// Returns 2 when fused, 0 otherwise.  GGML_CUDA_FUSE_GDN_GATE=0 turns it off.
-int ggml_cuda_add_softplus_mul_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
-    static const bool fuse_gdn_gate = getenv("GGML_CUDA_FUSE_GDN_GATE") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_GATE")) != 0;
-    ggml_tensor * node = cgraph->nodes[i];
-    if (!fuse_gdn_gate || node->op != GGML_OP_ADD || i + 2 >= cgraph->n_nodes ||
-            cgraph->nodes[i + 1]->op != GGML_OP_UNARY || cgraph->nodes[i + 2]->op != GGML_OP_MUL ||
-            !ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }) ||
-            !ggml_cuda_op_add_softplus_mul(ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
-        return 0;
-    }
-    return 2;
-}
-
-// scale -> silu/sigmoid unary (qwen4exp hyper-connection low-rank gate, e.g. silu(x / hc) in
-// build_hc_mix's prefill path): apply the activation while scaling.  Numerically identical
-// (same per-element expression).  Opt-out: GGML_CUDA_SCALE_UNARY=0.
 int ggml_cuda_scale_unary_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
     static const bool disable_scale_unary = getenv("GGML_CUDA_SCALE_UNARY") != nullptr && std::atoi(getenv("GGML_CUDA_SCALE_UNARY")) == 0;
     ggml_tensor * node = cgraph->nodes[i];

@@ -55,6 +55,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         nullptr,
         nullptr,
         "",
+        true, // v_enabled
         attn_stream_resident_size,
         attn_stream_resident_size_decode
     )),

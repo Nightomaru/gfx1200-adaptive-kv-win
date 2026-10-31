@@ -73,7 +73,6 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
-#include "ggml-cuda/gated-delta-net-mma.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/hc-mix.cuh"
 #include "ggml-cuda/hyperconn.cuh"
@@ -1446,10 +1445,6 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             }
         }
     }
-    if (mm_siblings.fork_event != nullptr) {
-        CUDA_CHECK(cudaEventDestroy(mm_siblings.fork_event));
-        CUDA_CHECK(cudaEventDestroy(mm_siblings.join_event));
-    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2431,9 +2426,9 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
-    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT  ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
-                : tensor->op == GGML_OP_GATED_DELTA_NET ? ggml_cuda_gated_delta_net_get_alloc_size(buft_ctx->device, tensor)
-                : ggml_nbytes(tensor);
+    size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
+        ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
+        : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
     // [TAG_ALLOC_SIZE_EXPAND]
@@ -5129,73 +5124,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     MMB_T(ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst), 6);
 }
 
-enum ggml_cuda_mul_mat_kernel {
-    GGML_CUDA_MUL_MAT_KERNEL_MMVQ,
-    GGML_CUDA_MUL_MAT_KERNEL_MMQ,
-    GGML_CUDA_MUL_MAT_KERNEL_OTHER,
-};
-
-// the kernel ggml_cuda_mul_mat(ctx, src0, src1, dst) takes, if mmvq or mmq (the same checks, in the same order)
-static ggml_cuda_mul_mat_kernel ggml_cuda_mul_mat_takes(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    if (ggml_cuda_op_mul_mat_use_fwht(dst)) {
-        return GGML_CUDA_MUL_MAT_KERNEL_OTHER;
-    }
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
-        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        return GGML_CUDA_MUL_MAT_KERNEL_OTHER;
-    }
-    const int     cc        = ggml_cuda_info().devices[ctx.device].cc;
-    const int     warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
-    const int64_t ne11      = src1->ne[1];
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11) || src0->ne[1] == 1) {
-        return GGML_CUDA_MUL_MAT_KERNEL_OTHER;
-    }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
-        return GGML_CUDA_MUL_MAT_KERNEL_OTHER;
-    }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
-        return GGML_CUDA_MUL_MAT_KERNEL_MMVQ;
-    }
-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
-        return GGML_CUDA_MUL_MAT_KERNEL_MMQ;
-    }
-    return GGML_CUDA_MUL_MAT_KERNEL_OTHER;
-}
-
-// SWIGLU whose output only feeds the next node, a MUL_MAT that runs as mmq (the dense FFN down projection in prefill):
-// the matmul quantizes silu(gate)*up from the GLU's sources, so the GLU output is never written. Bit-identical.
-// Ported from stew675/llama-cpp-rdna-boosts (block 15, FUSE_SWIGLU_MMQ; MIT). GGML_CUDA_DISABLE_SWIGLU_MMQ=1 turns it off.
-static bool ggml_cuda_try_fuse_swiglu_mmq(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
-    static const bool disabled = getenv("GGML_CUDA_DISABLE_SWIGLU_MMQ") != nullptr;
-    const ggml_tensor * glu = cgraph->nodes[i];
-    if (disabled || glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || i + 1 >= cgraph->n_nodes) {
-        return false;
-    }
-    ggml_tensor * mm = cgraph->nodes[i + 1];
-    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != glu || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE) ||
-            (glu->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_node_has_n_uses(cgraph, i, 1)) {
-        return false;
-    }
-    const ggml_tensor * g0 = glu->src[0];
-    const ggml_tensor * g1 = glu->src[1];
-    const auto rows_ok = [](const ggml_tensor * t) {
-        return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->nb[1] % sizeof(float) == 0 && t->ne[2] == 1 && t->ne[3] == 1;
-    };
-    if (glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || glu->ne[0] % 4 != 0 || glu->ne[2] != 1 || glu->ne[3] != 1 ||
-            !rows_ok(g0) || g0->ne[1] != glu->ne[1] || g0->ne[0] != (g1 ? glu->ne[0] : 2*glu->ne[0]) ||
-            (g1 && (!rows_ok(g1) || !ggml_are_same_shape(g1, glu)))) {
-        return false;
-    }
-    const ggml_type type = mm->src[0]->type;
-    if (!ggml_is_quantized(type) || type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4 ||
-            ggml_cuda_mul_mat_takes(ctx, mm->src[0], glu, mm) != GGML_CUDA_MUL_MAT_KERNEL_MMQ) {
-        return false;
-    }
-    ggml_cuda_mul_mat_q(ctx, mm->src[0], glu, nullptr, mm, glu);
-    return true;
-}
-
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -6683,13 +6611,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
-#if defined(GGML_USE_HIP)
-            // matmuls of the same activations run unfused one after another (ggml_cuda_mm_siblings)
-            std::vector<const ggml_tensor *> mm_group;
-            ggml_cuda_mm_siblings & siblings = cuda_ctx->mm_siblings;
-            siblings.capturing = use_cuda_graph && cuda_graph_update_required && ggml_cuda_mm_siblings_fork_enabled();
-            siblings.fork_node = nullptr;
-#endif // defined(GGML_USE_HIP)
 
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
@@ -6775,8 +6696,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 #endif // USE_CUDA_GRAPH
                 if (is_concurrent_event_active) {
-                    // nodes on other streams run in no order relative to the host's
-                    cuda_ctx->mmvq_q8_1.invalidate();
                     GGML_ASSERT(concurrent_event);
 
                     if (node == concurrent_event->join_node) {
@@ -6861,14 +6780,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
-                    for (int j = i; j <= i + nodes_to_skip; ++j) {
-                        cuda_ctx->mmvq_q8_1.written(cgraph->nodes[j]);
-                    }
-                    cuda_ctx->mmvq_q8_1.apply_pending();
                     i += nodes_to_skip;
-#if defined(GGML_USE_HIP)
-                    mm_group.clear();
-#endif // defined(GGML_USE_HIP)
                     continue;
                 }
 

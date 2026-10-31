@@ -1373,7 +1373,7 @@ uint32_t llama_context::verify_batch_width() const {
     return cparams.n_rs_batch;
 }
 
-void llama_context::switch_phase(bool decode, uint32_t n_tokens_next) {
+bool llama_context::switch_phase(bool decode, uint32_t n_tokens_next) {
     if (decode == phase_decode) {
         return true;
     }
@@ -1648,8 +1648,7 @@ void llama_context::sched_reserve(bool quiet) {
 
     const int64_t t_end_us = ggml_time_us();
 
-    llama_log_internal(log_level, "%s: reserve took %.2f ms, sched copies = %d
-",
+    llama_log_internal(log_level, "%s: reserve took %.2f ms, sched copies = %d",
             __func__, (t_end_us - t_start_us_l)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
@@ -6371,11 +6370,23 @@ llama_context * llama_init_from_model(
     // split/flash-attention one - assumes type_k == type_v, so a mixed configuration is rejected
     // rather than accepted as a slow-but-valid one.  Both types default to f16, so only an explicit
     // --cache-type-k (or --cache-type-v) can trigger this.
-    if (params.type_k != params.type_v) {
+    // Exception: kv-stream's pair.  The paged cache's own kernels (fattn-paged-decode) are written
+    // for exactly q8_0 K + q4_0/q5_1 V, and llama_kv_cache validates that pair below; both-quantized
+    // mixed pairs stay on the GPU FA path (measured on gfx1200, 27B pp512: q8_0/q8_0 667 t/s vs
+    // q8_0/q5_1 665 and q8_0/q4_0 667 - within run noise), so this is not the f16/bf16 cliff the
+    // rule guards.  The speculative draft inherits the same pair unstreamed and passes for the
+    // same reason.
+    if (params.type_k != params.type_v &&
+            !(params.type_k == GGML_TYPE_Q8_0 &&
+                    (params.type_v == GGML_TYPE_Q4_0 || params.type_v == GGML_TYPE_Q5_1))) {
         LLAMA_LOG_ERROR("%s: models require the same K and V cache types, got K=%s and V=%s; "
                 "set --cache-type-v to match --cache-type-k (both default to f16)\n",
                 __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
+    }
+    if (params.type_k != params.type_v) {
+        LLAMA_LOG_INFO("%s: allowing the kv-stream KV pair K=%s V=%s (the paged cache's native pair)\n",
+                __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
     }
 
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {

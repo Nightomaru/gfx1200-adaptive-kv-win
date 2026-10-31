@@ -3024,6 +3024,14 @@ bool llama_kv_cache::kq_mask_derivable(const llama_ubatch & ubatch) const {
         return false;
     }
 
+    // a paged KV (kv-stream) reads the pool through the page table: the FA node's K rows carry the
+    // resident-page geometry, not n_kv, so the derived cell_pos (n_kv rows) cannot attach to it
+    // (the shape assert in ggml_flash_attn_ext_add_kq_derived fires at context creation).  The
+    // paged decode kernel derives visibility from the page map itself.
+    if (stream) {
+        return false;
+    }
+
     // prefill-shaped batches only: below this the packed mask is a few hundred KiB, the launcher may
     // pick the vec/tile kernels and decode has to stay on the packed path
     if (ubatch.n_tokens <= 8) {

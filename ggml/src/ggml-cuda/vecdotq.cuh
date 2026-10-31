@@ -1167,16 +1167,12 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 
     const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
 
-    // iqs is in 0,4..28: 16 contiguous bytes of the 32-byte group j = iqs/8, whose low nibbles pair with q8_1 block
-    // 2*j and high nibbles with 2*j + 1, both at the same 16 values (h = (iqs/4) % 2) of those blocks
-    const int j = iqs/8;
-    const int h = (iqs/4) % 2;
+    int    v[2];
+    int    u[2*QR4_K];
+    float d8[QR4_K];
 
-    int v[4];
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        v[k] = get_int_b4(bq4_K->qs + 32*j + 16*h, k);
-    }
+    // iqs is in 0,2..30. bq8_offset = iqs/4 -> bq8_offset = 0, 2, 4, 6
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
 
     // iqs = 0....3 -> bq8_offset = 0, want q4_offset = 0, 4, 8, 12
     // iqs = 4....7 -> bq8_offset = 2, want q4_offset = 32, 36, 40, 44
@@ -1192,6 +1188,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     // nibbles of scales[j+2] plus the top 2 bits of scales[j-2], scales[j].  Both are built 32 bits at a time and the
     // lane's j (constant over the K loop) picks one.
     const uint16_t * scales = (const uint16_t *)bq4_K->scales;
+    const int j  = bq8_offset/2;
     const int jm = j & 1;
 
     const uint32_t s02 = scales[jm + 0] | ((uint32_t) scales[jm + 2] << 16);
@@ -1201,25 +1198,13 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     const uint32_t scm_hi = ((s4 | (s4 << 12)) & 0x0f0f0f0f) | ((s02 & 0xc0c0c0c0) >> 2);
     const uint32_t scm    = j >= 2 ? scm_hi : scm_lo;
 
-    float sumf_d = 0.0f;
-    float sumf_m = 0.0f;
-
-#pragma unroll
     for (int i = 0; i < QR4_K; ++i) {
-        const block_q8_1 * bq8i = bq8_1 + 2*j + i;
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
 
-        int dot1 = 0;
-        int dot2 = 0;
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const int u = get_int_b4(bq8i->qs, 4*h + k);
-            dot1 = ggml_cuda_dp4a((v[k] >> (4*i)) & 0x0F0F0F0F, u, dot1);
-            dot2 = ggml_cuda_dp4a(0x01010101, u, dot2);
-        }
-
-        const float d8 = __low2float(bq8i->ds);
-        sumf_d += d8 * (dot1 * sc[i]);
-        sumf_m += d8 * (dot2 * m[i]);
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
     }
 
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, scm, bq4_K->dm, d8);

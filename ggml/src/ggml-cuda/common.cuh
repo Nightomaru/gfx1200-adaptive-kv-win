@@ -174,6 +174,16 @@ static __device__ __forceinline__ void ggml_cuda_syncwarp() {
 // acquire-release fence over every address space: it waits for all outstanding global loads before the barrier and
 // invalidates the vector caches after it (global_inv). Scoping the fence to LDS keeps global loads in flight across the
 // barrier and the cached lines valid.
+// a*b rounded on its own, never contracted into an fma with a later add (HIP's __fmul_rn is a plain product)
+static __device__ __forceinline__ float ggml_cuda_fmul_rn(const float a, const float b) {
+#if defined(GGML_USE_HIP)
+#pragma clang fp contract(off)
+    return a * b;
+#else
+    return __fmul_rn(a, b);
+#endif // defined(GGML_USE_HIP)
+}
+
 static __device__ __forceinline__ void ggml_cuda_syncthreads_lds() {
 #if defined(GGML_USE_HIP) && defined(RDNA4)
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
@@ -1720,6 +1730,45 @@ struct ggml_cuda_stream_context {
 // subgraphs a split mode hands over (see `ggml_cuda_graph_get_key`): the key only *selects* an entry, a
 // replay still requires `ggml_cuda_graph_update_required` to find every node unchanged, so a collision
 // costs a recapture and never a mismatched replay.
+struct ggml_cuda_mm_siblings {
+    bool sibling   = false; // the node being run is a sibling
+    bool capturing = false; // capturing a graph in which siblings fork
+
+    const ggml_tensor *          fork_node = nullptr; // the mmvq whose matmul kernel fork_deps precede
+    std::vector<cudaGraphNode_t> fork_deps;
+    cudaEvent_t                  fork_event = nullptr;
+    cudaEvent_t                  join_event = nullptr;
+
+#if defined(GGML_USE_HIP)
+    // right before the matmul kernel of an mmvq on stream 0 in a capture: its siblings fork from here
+    void mark_fork(const ggml_tensor * node, cudaStream_t stream) {
+        if (fork_event == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&fork_event, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&join_event, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(fork_event, stream));
+        hipStreamCaptureStatus status;
+        const hipGraphNode_t * deps   = nullptr;
+        size_t                 n_deps = 0;
+        CUDA_CHECK(hipStreamGetCaptureInfo_v2(stream, &status, nullptr, nullptr, &deps, &n_deps));
+        fork_deps.assign(deps, deps + n_deps);
+        fork_node = node;
+    }
+
+    // s1 joins the capture with exactly fork_node's dependencies: a wait alone would keep s1's node from an earlier
+    // fork as a second dependency, and CLR only drops the barrier of a node with one
+    void fork(cudaStream_t s1) {
+        CUDA_CHECK(cudaStreamWaitEvent(s1, fork_event));
+        CUDA_CHECK(hipStreamUpdateCaptureDependencies(s1, fork_deps.data(), fork_deps.size(), hipStreamSetCaptureDependencies));
+    }
+
+    void join(cudaStream_t s1, cudaStream_t s0) {
+        CUDA_CHECK(cudaEventRecord(join_event, s1));
+        CUDA_CHECK(cudaStreamWaitEvent(s0, join_event));
+    }
+#endif // defined(GGML_USE_HIP)
+};
+
 struct ggml_cuda_mmvq_q8_1_cache {
     void *       buf      = nullptr;
     size_t       buf_size = 0;
@@ -1909,6 +1958,9 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    ggml_cuda_mmvq_q8_1_cache mmvq_q8_1;
+    ggml_cuda_mm_siblings     mm_siblings;
 
     // Host-pinned ring for the strided splice H2D (see `ggml_backend_cuda_set_tensor_2d_async`,
     // `stride_tensor == size && n_copies > 1`).  Owned by the context so the events and pinned
