@@ -120,6 +120,15 @@ static __device__ __forceinline__ int ggml_cuda_byte_perm(const int x, const int
 #endif
 }
 
+// b (0-255) in all 4 bytes
+static __device__ __forceinline__ uint32_t ggml_cuda_bcast_u8(const uint32_t b) {
+#if defined(GGML_USE_HIP)
+    return __builtin_amdgcn_perm(0, b, 0); // a multiply is quarter rate on RDNA
+#else
+    return b * 0x01010101;
+#endif // defined(GGML_USE_HIP)
+}
+
 static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     // v is a 7 bit int, with the 8th sign being encodable as popcnt
     // with xor we can "correct" the bit instead of having to mask

@@ -1720,21 +1720,45 @@ struct ggml_cuda_stream_context {
 // subgraphs a split mode hands over (see `ggml_cuda_graph_get_key`): the key only *selects* an entry, a
 // replay still requires `ggml_cuda_graph_update_required` to find every node unchanged, so a collision
 // costs a recapture and never a mismatched replay.
-struct ggml_cuda_graph_key {
-    const void * first_node_ptr;
-    int64_t      n_tokens;
-    // The data of the first device-resident weight the subgraph reads (fallback: nodes[0]->src[0]), and a
-    // cheap structural signature (node count, the first node's geometry/source, the last node's data, the
-    // first/last node names).  Under a split mode every layer's subgraph can begin on the same activation
-    // buffer, so without these a whole graph of layers shares one cache entry.  See ggml_cuda_graph_get_key.
-    const void * first_weight_ptr = nullptr;
-    uint64_t     shape_sig        = 0;
+struct ggml_cuda_mmvq_q8_1_cache {
+    void *       buf      = nullptr;
+    size_t       buf_size = 0;
+    const char * src      = nullptr; // data of the activations in buf, nullptr: no valid copy
+    size_t       src_size = 0;
+    int64_t      ne[GGML_MAX_DIMS] = {};
+    size_t       nb[GGML_MAX_DIMS] = {};
 
-    bool operator==(const ggml_cuda_graph_key & other) const {
-        return first_node_ptr  == other.first_node_ptr  &&
-               n_tokens        == other.n_tokens        &&
-               first_weight_ptr == other.first_weight_ptr &&
-               shape_sig       == other.shape_sig;
+    bool matches(const ggml_tensor * t) const {
+        if (!src || (const char *) t->data != src) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (t->ne[i] != ne[i] || t->nb[i] != nb[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void set(const ggml_tensor * t) {
+        src      = (const char *) t->data;
+        src_size = ggml_nbytes(t);
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            ne[i] = t->ne[i];
+            nb[i] = t->nb[i];
+        }
+    }
+
+    void invalidate() {
+        src = nullptr;
+    }
+
+    // a node wrote dst: the copy is stale if dst overlaps the activations it was made from
+    void written(const ggml_tensor * dst) {
+        const char * d = (const char *) dst->data;
+        if (src && d && d < src + src_size && src < d + ggml_nbytes(dst)) {
+            src = nullptr;
+        }
     }
 
     // buf if it can take size bytes, allocated on first use outside a CUDA graph capture (captured graphs keep its
@@ -1771,6 +1795,25 @@ struct ggml_cuda_graph_key {
             pending = nullptr;
         }
     }
+};
+
+struct ggml_cuda_graph_key {
+    const void * first_node_ptr;
+    int64_t      n_tokens;
+    // The data of the first device-resident weight the subgraph reads (fallback: nodes[0]->src[0]), and a
+    // cheap structural signature (node count, the first node's geometry/source, the last node's data, the
+    // first/last node names).  Under a split mode every layer's subgraph can begin on the same activation
+    // buffer, so without these a whole graph of layers shares one cache entry.  See ggml_cuda_graph_get_key.
+    const void * first_weight_ptr = nullptr;
+    uint64_t     shape_sig        = 0;
+
+    bool operator==(const ggml_cuda_graph_key & other) const {
+        return first_node_ptr  == other.first_node_ptr  &&
+               n_tokens        == other.n_tokens        &&
+               first_weight_ptr == other.first_weight_ptr &&
+               shape_sig       == other.shape_sig;
+    }
+
 };
 
 struct ggml_cuda_graph_key_hash {
