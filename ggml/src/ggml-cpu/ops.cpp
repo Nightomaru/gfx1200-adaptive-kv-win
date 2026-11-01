@@ -11607,9 +11607,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
     // ReplaySSM (ggml_gated_delta_net_rec): updates to commit first, and whether this batch records its own
+    // NOTE: the record flag is derived from src[6] (the rec tensor), not op param 1: the v16 plain op
+    // (ggml_gated_delta_net) writes n_rs_batch at param 1, which this kernel must never read as a flag.
     const ggml_tensor * src_rec    = dst->src[6];
     const ggml_tensor * src_commit = dst->src[7];
-    const bool    record = ggml_get_op_params_i32(dst, 1) != 0;
+    const bool    record = src_rec != nullptr;
     const int64_t R      = src_rec ? ggml_get_op_params_i32(dst, 2) : 0;
 
     const int64_t per_thread = S_v + (K > 1 || record ? S_v * S_v : 0);
