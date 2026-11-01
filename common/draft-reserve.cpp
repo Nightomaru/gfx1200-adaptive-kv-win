@@ -178,6 +178,18 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
     const bool have_indexer = read_u32_max(g, arch + ".attention.indexer.key_length", idx_len) &&
                              read_u32_max(g, arch + ".attention.indexer.head_count", idx_heads);
 
+    // A sliding-window draft (dflash) keeps only `sliding_window + n_ubatch` cells resident, however long
+    // the target's context is - the full-n_ctx form charged 997 MiB of KV for a cache that measured
+    // 22.66 MiB (2560 cells = 2048 + one 512 ubatch) at -c 131072, which pushed the fit over budget and
+    // starved 131072 outright.  Capped to the declared window, and only for an arch that declares one
+    // WITH a non-causal dflash-style cache: a plain SWA draft would under-estimate here (the dangerous
+    // direction), so the cap stays behind the explicit dflash arch check.
+    uint32_t kv_cells = n_ctx;
+    uint32_t sw = 0;
+    if (arch == "dflash" && read_u32_max(g, arch + ".attention.sliding_window", sw) && sw > 0) {
+        kv_cells = std::min(n_ctx, sw + n_ubatch);
+    }
+
     // KV layers the draft OWNS.  A `shared_kv_layers` draft (gemma4-assistant) does not allocate its own K/V at
     // all: llama_kv_cache's layer_share_cb reuses the TARGET's tensors (`layers.push_back(layer_share)`), and
     // kv_size is overridden to the source cache's.  Charging the full KV for it reserved 18 022 MiB for a
@@ -197,7 +209,7 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
                               ? (double) kv_own * (double) idx_heads * (double) idx_len * (double) F32_BYTES
                               : 0.0;
     // +10 % for per-row block padding and the KQ-mask padding llama.cpp adds to the cell count.
-    r.kv = (size_t) ((double) n_ctx * (attn_per_tok + idx_per_tok) * 1.10);
+    r.kv = (size_t) ((double) kv_cells * (attn_per_tok + idx_per_tok) * 1.10);
 
     // --- compute + slack: measured tiers -------------------------------------------------------
     // The draft context's compute buffer (pinned into the slab's narrow-2 region, and its mapping still comes
