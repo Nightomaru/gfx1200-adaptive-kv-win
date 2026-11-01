@@ -969,11 +969,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             }
         }
 
-        ggml_cuda_syncthreads_lds();
+        __syncthreads();
 
         vec_dot(tile_x, tile_y, sum, 0);
 
-        ggml_cuda_syncthreads_lds();
+        __syncthreads();
 
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
@@ -985,11 +985,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             }
         }
 
-        ggml_cuda_syncthreads_lds();
+        __syncthreads();
 
         vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
 
-        ggml_cuda_syncthreads_lds();
+        __syncthreads();
     }
 
     if constexpr (has_gate) {
@@ -2011,8 +2011,6 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 
 // -------------------------------------------------------------------------------------------------------------------------
 
-// swiglu: src1 is that SWIGLU node's output, never written; the activations are quantized from its sources instead
-// (2-D src1, no ids).
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion = nullptr, const ggml_tensor * swiglu = nullptr, bool swiglu_dense = false);

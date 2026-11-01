@@ -120,36 +120,13 @@ static __device__ __forceinline__ int ggml_cuda_byte_perm(const int x, const int
 #endif
 }
 
-// b (0-255) in all 4 bytes
-static __device__ __forceinline__ uint32_t ggml_cuda_bcast_u8(const uint32_t b) {
-#if defined(GGML_USE_HIP)
-    return __builtin_amdgcn_perm(0, b, 0); // a multiply is quarter rate on RDNA
-#else
-    return b * 0x01010101;
-#endif // defined(GGML_USE_HIP)
-}
-
 static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     // v is a 7 bit int, with the 8th sign being encodable as popcnt
     // with xor we can "correct" the bit instead of having to mask
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
     // broadcast over uint to allow for 0x08040201 / 0x80402010 as selectors
-    return ggml_cuda_bcast_u8(s);
-}
-
-// The bytes of grid, each negated where its sign bit is set: s holds a byte of signs in all 4 bytes; sel picks one bit
-// per byte, 0x08040201 for signs 0-3 and 0x80402010 for 4-7. HIP has no byte-wise SIMD compare or subtract. There m
-// is 1 in the negated bytes and (m << 8) - m is 0xFF there; -g = (g ^ 0xFF) + 1 does not carry into the next byte as
-// the grid bytes of all types that use this are nonzero.
-static __device__ __forceinline__ int ggml_cuda_apply_signs(const int grid, const uint32_t s, const uint32_t sel) {
-#if defined(GGML_USE_HIP)
-    const uint32_t m = (((s & sel) + 0x7F7F7F7Fu) >> 7) & 0x01010101u;
-    return (grid ^ ((m << 8) - m)) + m;
-#else
-    const int mask = __vcmpne4(s & sel, 0);
-    return __vsub4(grid ^ mask, mask);
-#endif // defined(GGML_USE_HIP)
+    return s * 0x01010101;
 }
 
 // sign-flips the 4 grid bytes selected by one nibble (shift 0 or 4) of the unpacked ksigns
@@ -1352,21 +1329,24 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
 
     const block_q5_K * bq5_K = (const block_q5_K *) vbq + kbx;
 
-    // as q4_K: 16 contiguous bytes of the 32-byte group j = iqs/8 (low nibbles: q8_1 block 2*j, high: 2*j + 1), and
-    // the matching 16 bytes of qh, whose bits 2*j and 2*j + 1 are the fifth bits of those two blocks
-    const int j = iqs/8;
-    const int h = (iqs/4) % 2;
+    int   vl[2];
+    int   vh[2];
+    int    u[2*QR5_K];
+    float d8[QR5_K];
 
-    int vl[4];
-    int vh[4];
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        vl[k] = get_int_b4(bq5_K->qs + 32*j + 16*h, k);
-        vh[k] = get_int_b4(bq5_K->qh + 16*h, k) >> (2*j);
-    }
+    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
+    const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    const int * qh = (const int *)(bq5_K->qh + 4 * ((iqs/2)%4));
+
+    vl[0] = ql[0];
+    vl[1] = ql[4];
+
+    vh[0] = qh[0] >> bq8_offset;
+    vh[1] = qh[4] >> bq8_offset;
 
     // same as q4_K
     const uint16_t * scales = (const uint16_t *)bq5_K->scales;
+    const int j  = bq8_offset/2;
     const int jm = j & 1;
 
     const uint32_t s0 = scales[jm + 0];
@@ -1382,31 +1362,17 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
-    float sumf_d = 0.0f;
-    float sumf_m = 0.0f;
-
 #pragma unroll
     for (int i = 0; i < QR5_K; ++i) {
-        const block_q8_1 * bq8i = bq8_1 + 2*j + i;
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
 
-        int dot1 = 0;
-        int dot2 = 0;
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const int vi = ((vl[k] >> (4*i)) & 0x0F0F0F0F) | (((vh[k] >> i) << 4) & 0x10101010);
-            const int u  = get_int_b4(bq8i->qs, 4*h + k);
-            dot1 = ggml_cuda_dp4a(vi, u, dot1);
-            dot2 = ggml_cuda_dp4a(0x01010101, u, dot2);
-        }
-
-        const float d8 = __low2float(bq8i->ds);
-        sumf_d += d8 * (dot1 * sc[i]);
-        sumf_m += d8 * (dot2 * m[i]);
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
     }
 
-    const float2 dm5f = __half22float2(bq5_K->dm);
-
-    return dm5f.x*sumf_d - dm5f.y*sumf_m;
+    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
 }
 
 // VDR=4 entry point: iqs must be a multiple of 4 (the mmvq kernel strides kqs
