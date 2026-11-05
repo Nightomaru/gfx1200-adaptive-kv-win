@@ -258,6 +258,17 @@ bool vmm_map(ggml_cuda_vmm_region * r, size_t addr_off, size_t bytes, bool host 
         if (p == r->phys) {
             continue;
         }
+#ifdef _WIN32
+        // Windows HIP: granting a peer access to a VMM mapping can fault the process inside
+        // hipMemSetAccess (measured 2026-11-06: an enumerated iGPU peer AVs amdhip64_7.dll at
+        // hipMemSetAccess+0x3F; hiding the device with HIP_VISIBLE_DEVICES=0 avoids it).  A refused
+        // peer is already a supported state (copies from that peer stage via host), so on Windows the
+        // grant is declined here instead of calling the driver.
+        GGML_LOG_WARN("%s: device %d: skipping the peer access grant for physical device %d on Windows "
+                      "(hipMemSetAccess can fault on peers here; copies from that peer stage via host).\n",
+                      __func__, r->device, p);
+        continue;
+#endif
         CUmemAccessDesc peer = {};
         peer.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         peer.location.id   = p;
@@ -297,6 +308,36 @@ ggml_cuda_vmm_region * ggml_cuda_vmm_region_create(int device, size_t bytes, siz
         }
         return nullptr;
     };
+#ifdef _WIN32
+    // The window's spill is a host-location VMM mapping (host and device see the same VA).  Some
+    // Windows HIP runtimes cannot create one: hipMemCreate with a HOST location returns
+    // out-of-memory when the process binds the SDK-bundled amdocl64, while the driver-store
+    // amdocl64 of the same machine supports it (measured 2026-11-06, TheRock 10.3.0a20261026 and
+    // 20261031 vs the Adrenalin driver stack).  The capability is a property of the loaded driver
+    // stack, not of Windows, so probe it: a tiny HOST handle that succeeds means the spill can be
+    // backed and the normal path runs; otherwise fail soft so every consumer (the fit's probe, the
+    // cache plan) declines with its own message and the KV takes the plain device buffer.
+    static const bool host_vmm_ok = [] {
+        CUmemAllocationProp prop = {};
+        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_HOST;
+        prop.location.id   = 0;
+        CUmemGenericAllocationHandle handle = 0;
+        const size_t probe_bytes = (size_t) 4 << 20;
+        const bool ok = cuMemCreate(&handle, probe_bytes, &prop, 0) == cudaSuccess;
+        if (ok) {
+            (void) cuMemRelease(handle);
+        } else {
+            (void) cudaGetLastError();
+        }
+        return ok;
+    }();
+    if (!host_vmm_ok) {
+        return fail("the windowed KV needs host-location VMM, which this Windows HIP runtime does not "
+                    "provide (hipMemCreate with a HOST location returns out-of-memory); the KV takes the "
+                    "plain device buffer");
+    }
+#endif
     if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
         return fail("bad device");
     }
