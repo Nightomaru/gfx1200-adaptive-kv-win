@@ -2967,6 +2967,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MAIN_GPU"));
     add_opt(common_arg(
+        { "-kvres", "--kv-resident-cells" }, "N|auto",
+        "windowed KV: keep the newest N cells resident in VRAM, spill the rest to pinned system RAM "
+        "(sets LLAMA_KV_RESIDENT_CELLS; 'auto' lets --fit size it; 0 = off)",
+        [](common_params & params, const std::string & value) {
+            if (value != "auto") {
+                for (char c : value) {
+                    if (c < '0' || c > '9') {
+                        throw std::runtime_error(
+                            string_format("error: unknown value for --kv-resident-cells: '%s' (use N or 'auto')\n", value.c_str()));
+                    }
+                }
+            }
+            // the streamed KV reads this variable with getenv at cache construction, so set the
+            // process environment here - one source of truth, no separate params plumbing
+            std::string kv = "LLAMA_KV_RESIDENT_CELLS=" + value;
+#ifdef _WIN32
+            _putenv(kv.c_str());
+#else
+            setenv("LLAMA_KV_RESIDENT_CELLS", value.c_str(), 1);
+#endif
+        }
+    ));
+    add_opt(common_arg(
         { "-fit", "--fit" }, "[on|off]",
         string_format("whether to adjust unset arguments to fit in device memory ('on' or 'off', default: '%s')", params.fit_params ? "on" : "off"),
         [](common_params & params, const std::string & value) {
