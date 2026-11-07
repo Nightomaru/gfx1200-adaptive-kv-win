@@ -333,6 +333,33 @@ ggml_cuda_vmm_region * ggml_cuda_vmm_region_create(int device, size_t bytes, siz
     }
 
     const int phys = ggml_cuda_get_physical_device(device);
+#ifdef _WIN32
+    // Windows HIP: an integrated GPU owning a VMM region faults the process in hipMemSetAccess
+    // even for the owner grant of a host-location mapping (measured 2026-11-08: the MoE-cache /
+    // slab-ring staging placed on the Raphael iGPU AVs at hipMemSetAccess+0x3F during gallocr
+    // reserve; the dGPU is unaffected).  hipDeviceProp_t::integrated is not reliably populated
+    // by this runtime, so query the attribute here, cached per logical device.  Integrated
+    // devices decline, fail-soft like the host-VMM probe above, and every consumer takes its
+    // plain-buffer fallback.
+    {
+        static bool checked[GGML_CUDA_MAX_DEVICES] = {};
+        static bool is_integrated[GGML_CUDA_MAX_DEVICES] = {};
+        if (!checked[device]) {
+            CUdevice cu_dev = 0;
+            int v = 0;
+            if (cuDeviceGet(&cu_dev, phys) == cudaSuccess) {
+                (void) cuDeviceGetAttribute(&v, CU_DEVICE_ATTRIBUTE_INTEGRATED, cu_dev);
+                (void) cudaGetLastError();
+            }
+            is_integrated[device] = v > 0;
+            checked[device] = true;
+        }
+        if (is_integrated[device]) {
+            return fail("integrated GPUs on Windows decline VMM regions (hipMemSetAccess faults on owner "
+                        "grants of host-location mappings); the consumer takes the plain path");
+        }
+    }
+#endif
     const size_t gran = vmm_granularity(device);
     if (gran == 0) {
         return fail("VMM unavailable on this device");
