@@ -58,7 +58,17 @@ static bool ggml_cuda_vmm_map_phys(int device, CUdeviceptr addr, size_t aligned,
     // destination and it faulted `Page not present or supervisor privilege` (the parked `-sm tensor`
     // + partial-arena fault).  Devices that cannot peer-map the range keep their own access (best
     // effort): a failed peer descriptor must not fail the mapping.
+#ifdef _WIN32
+    // Windows HIP: an iGPU descriptor can fault the process inside hipMemSetAccess itself
+    // (0xC0000005 at hipMemSetAccess+0x3F with the Raphael iGPU enumerated next to the dGPU,
+    // measured 2026-11-08) -- the same hazard the vmm-region provider guards (2026-11-06), here in
+    // the slab's own grant path.  The fault is inside the driver call, so refusing the descriptor
+    // afterwards does not help; on Windows only the owner descriptor is granted and every peer
+    // stages through host memory (see ggml_cuda_slab_peer_copy_ok).
+    const int n_dev = 1;
+#else
     const int n_dev = ggml_backend_cuda_get_device_count();
+#endif
     std::vector<CUmemAccessDesc> access;
     access.reserve((size_t) n_dev);
     {
@@ -68,6 +78,7 @@ static bool ggml_cuda_vmm_map_phys(int device, CUdeviceptr addr, size_t aligned,
         own.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         access.push_back(own);
     }
+#ifndef _WIN32
     for (int d = 0; d < n_dev; d++) {
         const int p = ggml_cuda_get_physical_device(d);
         if (p == phys) {
@@ -79,6 +90,7 @@ static bool ggml_cuda_vmm_map_phys(int device, CUdeviceptr addr, size_t aligned,
         peer.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         access.push_back(peer);
     }
+#endif
     // Grant the OWNER first, then each peer ON ITS OWN: one refused peer descriptor would otherwise poison
     // the whole call.  That is exactly what used to happen -- a single all-descriptors call failed on the
     // second and third ~29 GiB slab (no free VRAM left in the peers for the driver to build a 29 GiB peer
