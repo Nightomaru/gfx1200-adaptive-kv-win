@@ -24,6 +24,7 @@
 #define CUBLAS_FILL_MODE_UPPER HIPBLAS_FILL_MODE_UPPER
 #define CUBLAS_DIAG_NON_UNIT HIPBLAS_DIAG_NON_UNIT
 #define CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED hipDeviceAttributeVirtualMemoryManagementSupported
+#define CU_DEVICE_ATTRIBUTE_INTEGRATED hipDeviceAttributeIntegrated
 #define CU_MEM_ALLOC_GRANULARITY_RECOMMENDED hipMemAllocationGranularityRecommended
 #define CU_MEM_ALLOC_GRANULARITY_MINIMUM hipMemAllocationGranularityMinimum
 // wip/kv-residency (TODO #118): the mixed-backing KV (part of one VA reservation in system RAM) needs the
