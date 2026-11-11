@@ -35,6 +35,7 @@ jobs:
         with:
           restore: false
           save: false
+          update-package-index: true
 
       - name: Dependencies
         id: depends
