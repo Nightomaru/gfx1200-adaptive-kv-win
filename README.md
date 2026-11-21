@@ -1,3 +1,111 @@
+# llama.cpp (gfx1200-kv-resident-win)
+
+**Windowed KV streaming + RDNA boosts on native Windows for AMD RDNA 4 (gfx1200 / RX 9060 XT).**
+
+This fork is a current llama.cpp with the full [stew675/llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) delivery (`v17-4f9dfa0e3-r327`, 17 official blocks + temporary `0300`, strict `git am`, tree-verified against the canonical delivery) and the rdna-boosts **resident-window KV** (block 14) made to run on **native Windows**: the newest `N` KV cells stay in VRAM, the older tail spills to pinned system RAM inside one VA reservation - numerically transparent, no kernel changes, so a 16 GB card serves 27B-class models at 100K+ context.
+
+Current build: `b12390` @ `4082ce0cd` = upstream `4f9dfa0e3` (2026-11-13, +164 commits past the previous r258 base) + the r327 delivery + two Windows-specific VMM guard commits.
+
+## What this build does
+
+* **Newer llama.cpp** - upstream `4f9dfa0e3` (2026-11-13) + all 17 rdna-boosts blocks (FA band + native quantized K/V, chunked gated-delta-net prefill, adaptive MTP draft depth, k-quant boosts, fused kernels, host-resident MoE, slab + async input, qwen4exp, the streamed KV, the UMA GTT expert store, the server's prompt admission policy) plus the temporary relaxed-tensor-split block.
+* **`--kv-window auto|N`** - enables the resident-window KV (the delivery's first-class option; the old `LLAMA_KV_RESIDENT_CELLS` env var still works as a deprecated alias): N cells resident in VRAM, the rest spilled to pinned RAM (`auto` + `--fit` sizes it from your hardware; unset/0 = fully resident, byte-identical to stock).
+* **New in r327:** server prompt admission policy (`-ib`, max-min fair share under `--parallel`), UMA GTT expert store (APU-oriented), demand-gated expert arena settle (+8-32 % MoE prefill at large `-ub`), seq-parallel hyper-connections, and the fix for host-expert routed MoE silently running experts on the CPU at 17-31-token ubatches.
+* **RDNA boost for Windows, targeting `gfx1200`** - the full boost set compiled for RDNA4 on a Windows TheRock ROCm toolchain, plus Windows-specific fixes:
+  * the region provider **probes** host-location VMM at runtime: driver stacks that support it run the window, stacks that do not decline cleanly with one message (never a hang or a crash);
+  * an enumerated iGPU peer is never granted VMM access (`hipMemSetAccess` faults the process on some driver stacks - measured with a Raphael iGPU enumerated next to the RX 9060 XT; the guard declines every peer grant, zero faults).
+
+Two platform notes that matter:
+
+* **Do not put the build SDK's `bin` folder on `PATH` when serving.** The SDK-bundled `amdocl64.dll` lacks host-location VMM support; the Windows driver-store `amdocl64` (used automatically when not shadowed) has it. The capability probe handles it either way, but the window only *works* with the driver-store stack.
+* GSQ/`qwen35`-family models require **uniform K/V cache types** on this tree (`-ctk q8_0 -ctv q8_0`); mixed pairs like `q8_0`/`q5_1` are rejected. (The delivery's optional `mixed-kv` artifact re-enables some mixed pairs for 256-wide-attention models; it is not applied in this build.)
+
+## ROCm SDK (measured on RX 9060 XT)
+
+* **TheRock 10.2.0 stable** (`therock-dist-windows-gfx120X-all-10.2.0.tar.gz`, released 2026-11-18) - the current recommendation: builds clean (the 10.3.0a-nightly `ld.lld` crash on the head-512 FA-MMA instances is fixed), **no prefill cliff**, greedy text **bit-identical** to 10.1.0 (no hipBLASLt logit drift), prefill +1.2-3.5 % over 10.1.0 across plain / windowed / deep-spill arms. 10.2.0 ships `libtensilelite-host.dll` separately - bundle it beside the binaries (10.1.0 embeds it in `libhipblaslt.dll`).
+* TheRock **10.1.0 stable** remains a validated fallback.
+* Do **not** use the `10.3.0a20261026` nightly (ld.lld crash) or `20261031+` nightlies (about 40 % lower prefill + hipBLASLt logit drift).
+
+## Building on Windows
+
+1. **Visual Studio 2022/18 Build Tools** with the C++ workload (provides CMake + Ninja).
+2. **TheRock Windows `gfx120X` tarball** (ROCm toolchain + runtime):
+
+   ```
+   curl -O https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx120X-all-10.2.0.tar.gz
+   tar -xzf therock-dist-windows-gfx120X-all-10.2.0.tar.gz -C C:\path\to\rocm
+   ```
+
+3. **Configure and build** from a Developer Command Prompt (native configure - do **not** set `CMAKE_SYSTEM_NAME`/`CMAKE_CROSSCOMPILING`, that silently builds ggml-cpu as SSE2-only):
+
+   ```
+   cmake -S <source-dir> -B build -G Ninja ^
+     -DCMAKE_MAKE_PROGRAM "<vs>\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe" ^
+     -DCMAKE_C_COMPILER "<rocm>\lib\llvm\bin\clang.exe" ^
+     -DCMAKE_CXX_COMPILER "<rocm>\lib\llvm\bin\clang++.exe" ^
+     -DCMAKE_RC_COMPILER "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/rc.exe" ^
+     -DCMAKE_HIP_FLAGS "--rocm-path=<rocm>" ^
+     -DCMAKE_PREFIX_PATH "<rocm>" ^
+     -DCMAKE_BUILD_TYPE=Release ^
+     -DGPU_TARGETS=gfx1200 ^
+     -DBUILD_SHARED_LIBS=ON ^
+     -DLLAMA_BUILD_SERVER=ON ^
+     -DGGML_HIP=ON -DGGML_HIP_NO_VMM=ON -DGGML_HIP_HSA_COPY_ENGINE=OFF ^
+     -DGGML_OPENMP=OFF -DGGML_RPC=ON -DGGML_NATIVE=OFF -DGGML_STATIC=OFF ^
+     -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_BMI2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
+     -DGGML_CUDA_FA_QUANTS="bf16-bf16;f16-f16;q8_0-q8_0;q8_0-q5_1;q8_0-q5_0;q8_0-q4_1;q8_0-q4_0;q5_1-q5_1;q5_1-q5_0;q5_1-q4_1;q5_1-q4_0;q5_0-q5_0;q5_0-q4_1;q5_0-q4_0;q4_1-q4_1;q4_0-q4_0"
+   cmake --build build -j 12
+   ```
+
+4. Run the binaries with the driver's ROCm stack (default), or bundle the runtime DLLs from `<rocm>\bin` **plus `origami.dll`** (and `libtensilelite-host.dll` on 10.2.0) beside them. Do not bundle/PATH the SDK's `amdocl64.dll`.
+
+## Quick start: `llama-server` at 102K on a 16 GB card
+
+A serving configuration exercised at 102400 context with the window sized by `--fit`:
+
+```
+llama-server.exe ^
+  -m "C:\path\to\Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf" ^
+  --alias Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_S ^
+  -ngl 99 ^
+  -t 12 -tb 8 ^
+  -c 102400 ^
+  -ctk q8_0 -ctv q8_0 ^
+  -b 1024 -ub 512 ^
+  --kv-window auto ^
+  -kvu ^
+  -np 1 ^
+  -fa on ^
+  --prio 2 ^
+  --prio-batch 2 ^
+  --poll-batch 1 ^
+  --load-mode dio ^
+  --jinja ^
+  --model-draft "C:\path\to\Qwen3.8-27B-DFlash2-Q4_K_M.gguf" ^
+  --spec-type draft-dflash,ngram-mod ^
+  -ngld all ^
+  --spec-draft-n-max 4 ^
+  --reasoning on ^
+  --reasoning-preserve ^
+  --temp 1 --top-p 0.95 --top-k 20 --min-p 0.0 --presence-penalty 0 --repeat-penalty 1.0 ^
+  --host 127.0.0.1 --port 6767
+```
+
+Drop the `--model-draft` / `--spec-type` / `-ngld` lines for target-only serving. Related knobs: `LLAMA_KV_SPILL_RAM_PCT` (pinned-RAM ceiling for the spill, default 85 % of available RAM), and `--fit` prints the resident/spill split it chose. `HIP_VISIBLE_DEVICES=0` is worth setting on systems with an enumerated iGPU.
+
+## Credits
+
+* [stew675/llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) - the RDNA boost patch set this build applies (blocks 00-16 + `0300` of `v17-4f9dfa0e3-r327`), including the streamed-KV resident window this fork makes runnable on Windows.
+* [achyudh/llama.cpp](https://github.com/achyudh/llama.cpp/tree/feature/adaptive-kv-stream-rocm) - the original adaptive-KV-streaming ROCm fork that demonstrated KV streaming on RDNA 4 and inspired this direction.
+* [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) - the base project.
+* AMD TheRock - the open Windows ROCm toolchain this build uses.
+
+---
+
+*(Original upstream llama.cpp documentation follows below)*
+
+---
+
 # llama.cpp
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
